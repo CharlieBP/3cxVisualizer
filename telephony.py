@@ -132,10 +132,14 @@ def format_user_details(user_info):
     return ", ".join(details)
 
 def get_node_label_and_style(identifier, type_hint, all_data):
-    # (Ongewijzigd)
-    users_df = all_data.get("users", pd.DataFrame()); queues_df = all_data.get("queues", pd.DataFrame())
-    ringgroups_df = all_data.get("ringgroups", pd.DataFrame()); receptionists_df_all = all_data.get("receptionists_all", pd.DataFrame())
+    """Genereert label en bepaalt stijl, nu inclusief Q/RG tijden (robuuster)."""
+    users_df = all_data.get("users", pd.DataFrame())
+    queues_df = all_data.get("queues", pd.DataFrame())
+    ringgroups_df = all_data.get("ringgroups", pd.DataFrame())
+    receptionists_df_all = all_data.get("receptionists_all", pd.DataFrame())
+
     label = f"❓ Onbekend ID: {identifier}"; shape = 'box'; fillcolor = 'lightgrey'; node_type = "Unknown"
+
     if pd.isna(identifier) or identifier == "": label = "Niet geconfigureerd"; node_type="ConfigError"
     elif type_hint == "EndCall": label = "❌ Ophangen"; shape='octagon'; fillcolor='red'; node_type="End"
     elif type_hint == "Repeat": label = "🔁 Herhaal Prompt"; shape='invhouse'; fillcolor='orange'; node_type="Action"
@@ -144,42 +148,69 @@ def get_node_label_and_style(identifier, type_hint, all_data):
     elif type_hint == "UnknownText": label = f"❓ Tekst:\n{identifier}"; node_type="Unknown"
     elif str(identifier).isdigit():
         ext_nr = str(identifier); label = f"❓ Ext: {ext_nr}"
+
         # Check Queues
         if node_type=="Unknown" and not queues_df.empty and (type_hint=="Queue" or type_hint=="ExtensionNumber" or type_hint=="UnknownType"):
             queue = queues_df[queues_df["Virtual Extension Number"] == ext_nr]
             if not queue.empty:
-                q_info=queue.iloc[0]; q_name=q_info.get('Queue Name',f"Queue {ext_nr}")
-                ring_time = q_info.get('Ring time (s)', None); max_wait = q_info.get('Max queue wait time (s)', None)
-                rt_str = f"{int(ring_time)}s" if pd.notna(ring_time) and isinstance(ring_time,(int,float)) else "N/A"
-                mw_str = f"{int(max_wait)}s" if pd.notna(max_wait) and isinstance(max_wait,(int,float)) else "N/A"
-                time_label = f"(Ring: {rt_str}, Max Wait: {mw_str})"
-                members = [f"{qi[col]} ({format_user_details(u_info.iloc[0])})" if not (u_info := users_df[users_df['Naam'] == qi[col]]).empty else f"{qi[col]} (❓)" for col in q_info.index if col.startswith("User ") and pd.notna(qi:=q_info)[col]]
+                queue_info=queue.iloc[0]; queue_name=queue_info.get('Queue Name',f"Queue {ext_nr}")
+
+                # --- Verbeterde Tijd Ophalen ---
+                ring_time_str = "N/A"; max_wait_str = "N/A"
+                # Ring time
+                if 'Ring time (s)' in queue_info:
+                    ring_time_val = pd.to_numeric(queue_info['Ring time (s)'], errors='coerce')
+                    if pd.notna(ring_time_val):
+                        ring_time_str = f"{int(ring_time_val)}s"
+                # Max queue wait time
+                if 'Max queue wait time (s)' in queue_info:
+                     max_wait_val = pd.to_numeric(queue_info['Max queue wait time (s)'], errors='coerce')
+                     if pd.notna(max_wait_val):
+                          max_wait_str = f"{int(max_wait_val)}s"
+                time_label = f"(Ring: {ring_time_str}, MaxWait: {max_wait_str})"
+                # --- Einde Verbeterde Tijd Ophalen ---
+
+                members = [f"{q_info[col]} ({format_user_details(u_info.iloc[0])})" if not (u_info := users_df[users_df['Naam'] == q_info[col]]).empty else f"{q_info[col]} (❓)" for col in queue_info.index if col.startswith("User ") and pd.notna(q_info:=queue_info)[col]]
                 members_str = "\n ".join(members) if members else "(Geen leden)"
-                label = f"👥 Queue: {q_name} ({ext_nr})\n{time_label}\nLeden:\n {members_str}"; shape='box'; fillcolor='palegreen'; node_type="Queue"
+                label = f"👥 Queue: {queue_name} ({ext_nr})\n{time_label}\nLeden:\n {members_str}"; shape='box'; fillcolor='palegreen'; node_type="Queue"
+
         # Check Ring Groups
         if node_type=="Unknown" and not ringgroups_df.empty and (type_hint=="RingGroup" or type_hint=="ExtensionNumber" or type_hint=="UnknownType"):
             rg = ringgroups_df[ringgroups_df["Virtual Extension Number"] == ext_nr]
             if not rg.empty:
                 rg_info=rg.iloc[0]; rg_name=rg_info.get('Ring Group Name',f"Ring Group {ext_nr}")
-                ring_time = rg_info.get('Ring time (s)', None); rt_str = f"{int(ring_time)}s" if pd.notna(ring_time) and isinstance(ring_time,(int,float)) else "N/A"; time_label = f"(Ring: {rt_str})"
+
+                # --- Verbeterde Tijd Ophalen ---
+                ring_time_str = "N/A"
+                if 'Ring time (s)' in rg_info:
+                    ring_time_val = pd.to_numeric(rg_info['Ring time (s)'], errors='coerce')
+                    if pd.notna(ring_time_val):
+                        ring_time_str = f"{int(ring_time_val)}s"
+                time_label = f"(Ring: {ring_time_str})"
+                 # --- Einde Verbeterde Tijd Ophalen ---
+
                 members = [f"{ri[col]} ({format_user_details(u_info.iloc[0])})" if not (u_info := users_df[users_df['Naam'] == ri[col]]).empty else f"{ri[col]} (❓)" for col in rg_info.index if col.startswith("User ") and pd.notna(ri:=rg_info)[col]]
                 members_str = "\n ".join(members) if members else "(Geen leden)"
                 label = f"🔔 RG: {rg_name} ({ext_nr})\n{time_label}\nLeden:\n {members_str}"; shape='box'; fillcolor='lightskyblue'; node_type="RingGroup"
-        # Check Users
-        if node_type=="Unknown" and not users_df.empty and (type_hint=="User" or type_hint=="ExtensionNumber" or type_hint=="UnknownType"):
+
+        # Check Users (als geen queue/rg)
+        if node_type == "Unknown" and not users_df.empty and (type_hint == "User" or type_hint == "ExtensionNumber" or type_hint == "UnknownType"):
             user = users_df[users_df["Number"] == ext_nr]
             if not user.empty:
                 user_info = user.iloc[0]; user_name = user_info.get('Naam', f"User {ext_nr}")
                 label = f"👤 Gebruiker: {user_name}\n({format_user_details(user_info)})"; shape='ellipse'; fillcolor='whitesmoke'; node_type="User"
-        # Check DRs
-        if node_type=="Unknown" and not receptionists_df_all.empty and (type_hint=="DR" or type_hint=="ExtensionNumber" or type_hint=="UnknownType"):
+
+        # Check DRs (als geen queue/rg/user)
+        if node_type == "Unknown" and not receptionists_df_all.empty and (type_hint == "DR" or type_hint == "ExtensionNumber" or type_hint == "UnknownType"):
              dr = receptionists_df_all[receptionists_df_all["Virtual Extension Number"] == ext_nr]
              if not dr.empty: dr_info=dr.iloc[0]; dr_name=dr_info.get('Digital Receptionist Name',f"DR {ext_nr}"); label = f"🚦 IVR: {dr_name}\n({ext_nr})"; shape='Mdiamond'; fillcolor='lightcoral'; node_type="DR"
-        # Check Voicemail
-        if node_type=="Unknown" and type_hint == "Voicemail":
+
+        # Check Voicemail (specifiek type)
+        if node_type == "Unknown" and type_hint == "Voicemail":
             user_vm = users_df[users_df["Number"] == ext_nr] if not users_df.empty else pd.DataFrame()
             vm_owner = user_vm.iloc[0].get('Naam', '') if not user_vm.empty else ''
             label = f"🎙️ Voicemail ({ext_nr})\n{'van: '+vm_owner if vm_owner else ''}"; shape='cylinder'; fillcolor='mediumpurple'; node_type="Voicemail"
+
     return label, shape, fillcolor, node_type
 
 # --- Streamlit UI & Hoofdlogica ---
