@@ -222,11 +222,10 @@ all_data = None
 
 if uploaded_zip is not None:
     zip_content_bytes = uploaded_zip.getvalue()
-    all_data = load_data_from_zip(zip_content_bytes)
+    all_data = load_data_from_zip(zip_content_bytes) # Functie van vorige versie
 
 if all_data:
     receptionists_df_primary = all_data.get("receptionists_primary", pd.DataFrame())
-    # Haal deze hier op zodat ze beschikbaar zijn in de loop
     queues_df = all_data.get("queues", pd.DataFrame())
     ringgroups_df = all_data.get("ringgroups", pd.DataFrame())
 
@@ -240,8 +239,30 @@ if all_data:
             dr_name = dr.get("Digital Receptionist Name", "Naamloos")
             dr_ext = dr.get("Virtual Extension Number", "GEEN_EXT")
             if dr_ext == "GEEN_EXT" or pd.isna(dr_ext): continue
+
+            # Haal menu opties op om te bepalen of er een menu is
+            menu_options_strings = {}
+            has_menu = False
+            for i in range(10):
+                menu_col = f"Menu {i}";
+                if menu_col in dr.index and pd.notna(dr[menu_col]) and str(dr[menu_col]).strip():
+                    menu_options_strings[i] = dr[menu_col]; has_menu = True
+
+            # *** NIEUW: Haal IVR timeout op EN voeg toe aan startlabel ALS er een menu is ***
             ivr_timeout_sec_val = dr.get("If no input within seconds", None)
-            ivr_timeout_label = f" ({ivr_timeout_sec_val}s)" if pd.notna(ivr_timeout_sec_val) else ""
+            ivr_timeout_num = pd.to_numeric(ivr_timeout_sec_val, errors='coerce')
+            ivr_timeout_info = "" # Leeg standaard
+            # Voeg timeout info alleen toe aan startlabel als er een menu is
+            if has_menu and pd.notna(ivr_timeout_num):
+                ivr_timeout_info = f"\nTimeout: {int(ivr_timeout_num)}s"
+
+            # Creëer startlabel MET timeout info indien relevant
+            start_label = f"🚦 IVR: {dr_name}\n({dr_ext}){ivr_timeout_info}"
+            # --- EINDE NIEUW ---
+
+            # Haal timeout label voor de Pijl apart op (voor duidelijkheid op de pijl)
+            ivr_timeout_edge_label_part = f" ({int(ivr_timeout_num)}s)" if pd.notna(ivr_timeout_num) else ""
+
 
             with st.expander(f"IVR: {dr_name} ({dr_ext})"):
                 dot = graphviz.Digraph(name=f'Flow_{dr_ext}', comment=f'Call Flow for {dr_name}')
@@ -260,22 +281,18 @@ if all_data:
                          added_nodes.add(node_id)
                      return node_id
 
-                # *** Helper krijgt nu all_data mee ***
+                # Helper krijgt nu all_data mee
                 def draw_destination(source_node_id, edge_label, dest_string, current_all_data):
+                    # (Deze helper functie blijft ongewijzigd t.o.v. vorige versie)
                     dest_type, dest_id = parse_destination(dest_string)
-                    target_node_id = make_node_id("END", f"{source_node_id}_{edge_label.replace(' ','_')}")
-                    # *** Geef all_data door ***
+                    target_node_id = make_node_id("END", f"{source_node_id}_{edge_label.replace(' ','_').replace('/','_')}")
                     target_label, target_shape, target_color, target_node_type = get_node_label_and_style(None, "EndCall", current_all_data)
                     if dest_type:
-                        target_node_id = make_node_id(f"DEST_{dest_type}", f"{source_node_id}_{edge_label.replace(' ','_')}_{dest_id}")
-                        # *** Geef all_data door ***
+                        target_node_id = make_node_id(f"DEST_{dest_type}", f"{source_node_id}_{edge_label.replace(' ','_').replace('/','_')}_{dest_id}")
                         target_label, target_shape, target_color, target_node_type = get_node_label_and_style(dest_id, dest_type, current_all_data)
-
                     create_or_get_node(dot, target_node_id, target_label, shape=target_shape, fillcolor=target_color)
                     edge_key = (source_node_id, target_node_id, edge_label)
                     if edge_key not in added_edges: dot.edge(source_node_id, target_node_id, label=edge_label); added_edges.add(edge_key)
-
-                    # Teken 'No Answer' voor Queue/RG
                     if target_node_type in ["Queue", "RingGroup"] and dest_id:
                          q_df = current_all_data.get("queues", pd.DataFrame())
                          rg_df = current_all_data.get("ringgroups", pd.DataFrame())
@@ -285,11 +302,9 @@ if all_data:
                              noans_dest = row.iloc[0].get("Destination if no answer", np.nan)
                              noans_type, noans_id = parse_destination(noans_dest)
                              noans_target_node_id = make_node_id("END", f"{target_node_id}_NoAns")
-                             # *** Geef all_data door ***
                              noans_label, noans_shape, noans_color, _ = get_node_label_and_style(None, "EndCall", current_all_data)
                              if noans_type:
                                   noans_target_node_id = make_node_id(f"NOANS_{noans_type}", f"{target_node_id}_{noans_id}")
-                                  # *** Geef all_data door ***
                                   noans_label, noans_shape, noans_color, _ = get_node_label_and_style(noans_id, noans_type, current_all_data)
                              create_or_get_node(dot, noans_target_node_id, noans_label, shape=noans_shape, fillcolor=noans_color)
                              noans_edge_key = (target_node_id, noans_target_node_id, "No Answer")
@@ -297,58 +312,43 @@ if all_data:
 
                 # --- Teken de flow ---
                 start_node_id = make_node_id("IVR", dr_ext)
-                # *** Geef all_data door ***
-                start_label, start_shape, start_color, _ = get_node_label_and_style(dr_ext, "DR", all_data)
+                # Gebruik het eerder gemaakte start_label (nu met timeout info indien relevant)
+                _, start_shape, start_color, _ = get_node_label_and_style(dr_ext, "DR", all_data)
                 create_or_get_node(dot, start_node_id, start_label, shape=start_shape, fillcolor=start_color)
 
-                # Tijd checks
-                office_check_node = make_node_id("OFFICECHECK", "")
-                # *** Geef all_data door (ook al niet direct nodig) ***
-                _, office_shape, office_color, _ = get_node_label_and_style("","Check", all_data)
-                create_or_get_node(dot, office_check_node, "Binnen kantooruren?", shape=office_shape, fillcolor=office_color); dot.edge(start_node_id, office_check_node)
-                break_check_node = make_node_id("BREAKCHECK", ""); create_or_get_node(dot, break_check_node, "Pauze actief?", shape=office_shape, fillcolor=office_color); dot.edge(office_check_node, break_check_node, label="Ja")
-                holiday_check_node = make_node_id("HOLIDAYCHECK", ""); create_or_get_node(dot, holiday_check_node, "Vakantie actief?", shape=office_shape, fillcolor=office_color); dot.edge(break_check_node, holiday_check_node, label="Nee")
-                in_hours_node = make_node_id("INHOURS", ""); create_or_get_node(dot, in_hours_node, "Actie binnen kantooruren", shape='ellipse', fillcolor='lightgrey'); dot.edge(holiday_check_node, in_hours_node, label="Nee")
+                # Tijd checks (ongewijzigd)
+                office_check_node = make_node_id("OFFICECHECK", ""); _, office_shape, office_color, _ = get_node_label_and_style("","Check", all_data); create_or_get_node(dot, office_check_node, "Binnen kantooruren?", shape=office_shape, fillcolor=office_color); edge_key=(start_node_id, office_check_node); dot.edge(start_node_id, office_check_node); added_edges.add(edge_key)
+                break_check_node = make_node_id("BREAKCHECK", ""); create_or_get_node(dot, break_check_node, "Pauze actief?", shape=office_shape, fillcolor=office_color); edge_key=(office_check_node, break_check_node,"Ja"); dot.edge(office_check_node, break_check_node, label="Ja"); added_edges.add(edge_key)
+                holiday_check_node = make_node_id("HOLIDAYCHECK", ""); create_or_get_node(dot, holiday_check_node, "Vakantie actief?", shape=office_shape, fillcolor=office_color); edge_key=(break_check_node, holiday_check_node,"Nee"); dot.edge(break_check_node, holiday_check_node, label="Nee"); added_edges.add(edge_key)
+                in_hours_node = make_node_id("INHOURS", ""); create_or_get_node(dot, in_hours_node, "Actie binnen kantooruren", shape='ellipse', fillcolor='lightgrey'); edge_key=(holiday_check_node, in_hours_node, "Nee"); dot.edge(holiday_check_node, in_hours_node, label="Nee"); added_edges.add(edge_key)
 
-                # Haal bestemmingen op
+                # Haal bestemmingen op (ongewijzigd)
                 dest_strings = { 'closed': dr.get("When office is closed route to", np.nan), 'break': dr.get("When on break route to", np.nan), 'holiday': dr.get(next((col for col in ["When on holiday route to", "When on holiday route to "] if col in dr.index), "non_existing_col"), np.nan), 'default': dr.get("Send call to", np.nan), 'invalid': dr.get("Invalid input destination", np.nan) }
-                menu_options_strings = {}; has_menu = False
-                for i in range(10):
-                    menu_col = f"Menu {i}";
-                    if menu_col in dr.index and pd.notna(dr[menu_col]) and str(dr[menu_col]).strip(): menu_options_strings[i] = dr[menu_col]; has_menu = True
 
                 # Teken tijd-gebaseerde routes
-                # *** Geef all_data door ***
                 draw_destination(office_check_node, "Nee", dest_strings['closed'], all_data)
                 draw_destination(break_check_node, "Ja", dest_strings['break'], all_data)
-                # Vakantie route
                 holiday_type, holiday_id = parse_destination(dest_strings['holiday'])
-                if holiday_type:
-                    # *** Geef all_data door ***
-                    draw_destination(holiday_check_node, "Ja", dest_strings['holiday'], all_data)
+                if holiday_type: draw_destination(holiday_check_node, "Ja", dest_strings['holiday'], all_data)
                 else:
-                     edge_key = (holiday_check_node, in_hours_node, "Ja (geen route)")
-                     if edge_key not in added_edges: dot.edge(holiday_check_node, in_hours_node, label="Ja (geen route)"); added_edges.add(edge_key)
+                    edge_key=(holiday_check_node, in_hours_node, "Ja (geen route)")
+                    if edge_key not in added_edges: dot.edge(holiday_check_node, in_hours_node, label="Ja (geen route)"); added_edges.add(edge_key)
 
                 # Menu / Directe Route
                 if has_menu:
                     dot.node(in_hours_node, "🎶 Menu speelt...")
                     for key, dest_str in menu_options_strings.items():
-                         # *** Geef all_data door ***
                         draw_destination(in_hours_node, f"Kies {key}", dest_str, all_data)
 
-                    # Timeout pijl met tijd
-                    timeout_edge_label = f"Timeout{ivr_timeout_label} /\nGeen invoer"
-                    # *** Geef all_data door ***
+                    # Timeout pijl met tijd (gebruik het apart gemaakte label)
+                    timeout_edge_label = f"Timeout{ivr_timeout_edge_label_part} /\nGeen invoer"
                     draw_destination(in_hours_node, timeout_edge_label, dest_strings['default'], all_data)
 
                     # Invalid (als anders)
                     if dest_strings['invalid'] != dest_strings['default'] and pd.notna(dest_strings['invalid']):
-                        # *** Geef all_data door ***
                         draw_destination(in_hours_node, "Invalid", dest_strings['invalid'], all_data)
                 else: # Geen menu
                     dot.node(in_hours_node, "Geen menu")
-                    # *** Geef all_data door ***
                     draw_destination(in_hours_node, "Direct", dest_strings['default'], all_data)
 
                 # Toon grafiek
