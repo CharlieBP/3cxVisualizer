@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Jupyter & Streamlit cache
+.ipynb_checkpoints
+.streamlit/
+.cache/
+.cache/*
+
+# VSCode / PyCharm / IDE settings
+.idea/
+.vscode/
+
+# OS bestanden
+.DS_Store
+Thumbs.db
+
+# Logbestanden
+*.log
+
+# Gevoelige configuraties
+*.env
+.env.*
+
+# CSV's en outputbestanden (indien lokaal)
+*.csv
+
+# PyInstaller output
+*.spec
+*.exe
+*.zip
