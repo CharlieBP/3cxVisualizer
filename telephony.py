@@ -6,6 +6,18 @@ import numpy as np
 import re
 import zipfile
 import io
+import warnings
+
+# --- Onderdruk specifieke Graphviz warning --- 
+try:
+    # Probeer de specifieke warning klasse te importeren als die bestaat
+    from graphviz.quoting import DotSyntaxWarning
+    warnings.filterwarnings("ignore", category=DotSyntaxWarning)
+except ImportError:
+    # Fallback als de specifieke klasse niet bestaat (oudere version?) 
+    # Probeer te filteren op basis van message - minder robuust
+    warnings.filterwarnings("ignore", message=".*expect syntax error scanning invalid quoted string.*", category=UserWarning) # of DeprecationWarning? Kan varieren.
+# --- Einde onderdrukking ---
 
 # Pagina configuratie
 st.set_page_config(layout="wide")
@@ -383,25 +395,31 @@ if all_data:
     def draw_destination_refactored(dot_graph, source_node_id, edge_label, dest_string, current_all_data, context, added_nodes_set, added_edges_set, depth=0, max_depth=10, visited_paths=None):
         """Tekent een pijl naar een bestemming en volgt recursief (met diepte limiet en cyclus detectie)."""
         if depth > max_depth:
-            # Teken een speciale node om aan te geven dat max diepte is bereikt
             max_depth_node_id = make_node_id_refactored("MAXDEPTH", f"{source_node_id}_{edge_label}", context)
             create_or_get_node_refactored(dot_graph, max_depth_node_id, "Max Recursion Depth Reached", added_nodes_set, shape='octagon', fillcolor='orange')
             edge_key = (source_node_id, max_depth_node_id, edge_label + " (max depth)")
             if edge_key not in added_edges_set:
                 dot_graph.edge(source_node_id, max_depth_node_id, label=edge_label + " (max depth)")
                 added_edges_set.add(edge_key)
-            return # Stop recursie hier
+            return
 
-        if visited_paths is None:
-            visited_paths = set()
+        if visited_paths is None: visited_paths = set()
 
         dest_type, dest_id = parse_destination(dest_string)
         path_key = (source_node_id, dest_type, dest_id)
 
-        # Basis geval: geen bestemming of al bezocht pad
+        # --- Opschonen Edge Label voor Node ID --- 
+        # Verwijder potentieel problematische tekens voordat ze in node ID komen
+        safe_edge_label_for_id = edge_label.replace(' ','_').replace('/','_').replace('\n','_')\
+                                          .replace('(','').replace(')','').replace(':','')\
+                                          .replace("\\", "_") # Vervang expliciet backslash
+        # --- Einde Opschonen ---
+
+        # Basis geval: geen bestemming
         if not dest_type:
+            # Gebruik opgeschoonde label voor ID
+            target_node_id = make_node_id_refactored("END", f"{source_node_id}_{safe_edge_label_for_id}", context)
             target_label, target_shape, target_color, _ = get_node_label_and_style(None, "EndCall", current_all_data)
-            target_node_id = make_node_id_refactored("END", f"{source_node_id}_{edge_label}", context)
             create_or_get_node_refactored(dot_graph, target_node_id, target_label, added_nodes_set, shape=target_shape, fillcolor=target_color)
             edge_key = (source_node_id, target_node_id, edge_label)
             if edge_key not in added_edges_set: dot_graph.edge(source_node_id, target_node_id, label=edge_label); added_edges_set.add(edge_key)
@@ -519,7 +537,7 @@ if all_data:
         if receptionists_df_all.empty:
             st.warning("Geen Digital Receptionists gevonden in het ZIP-bestand.")
         elif 'Onderdeel' not in receptionists_df_all.columns:
-            st.error("Kolom 'Onderdeel' niet gevonden in Receptionists.csv. Kan flows niet groeperen.")
+            st.error("Kolom 'Onderdeel' (of eerste kolom) niet gevonden in Receptionists.csv.")
         else:
             # Maak kolom 'Onderdeel' string en vul NaN
             receptionists_df_all['Onderdeel'] = receptionists_df_all['Onderdeel'].astype(str).fillna('LEEG')
@@ -527,7 +545,7 @@ if all_data:
             drs_met_geldig_onderdeel = receptionists_df_all[
                 (receptionists_df_all['Onderdeel'] != 'LEEG') &
                 (receptionists_df_all['Onderdeel'] != '?') &
-                (receptionists_df_all['Onderdeel'].str.strip() != '') # Ook lege strings uitsluiten
+                (receptionists_df_all['Onderdeel'].str.strip() != '')
             ].copy()
             # Filter DRs zonder geldig onderdeel
             drs_zonder_geldig_onderdeel = receptionists_df_all[
@@ -536,32 +554,29 @@ if all_data:
                 (receptionists_df_all['Onderdeel'].str.strip() == '')
             ].copy()
 
-            # --- BELANGRIJK: Bewaar lijst van *alle* geldige onderdeel namen --- 
+            # Bepaal *vooraf* de lijst van alle geldige onderdeelnamen
             alle_geldige_onderdelen_namen = []
             if 'Onderdeel' in receptionists_df_all.columns:
-                # Zorg ervoor dat kolom string is en filter ongeldige waarden
-                geldige_onderdelen_series = receptionists_df_all['Onderdeel'].astype(str).fillna('LEEG')
+                geldige_onderdelen_series = receptionists_df_all['Onderdeel'] # Gebruik reeds geconverteerde kolom
                 alle_geldige_onderdelen_namen = sorted(geldige_onderdelen_series[
                      (geldige_onderdelen_series != 'LEEG') & 
                      (geldige_onderdelen_series != '?') & 
                      (geldige_onderdelen_series.str.strip() != '')
                 ].unique())
-            # --- Einde aanpassing ---
-            
+
             # --- 1. Genereer Flows per Geldig Onderdeel ---
             if not drs_met_geldig_onderdeel.empty:
                 grouped_receptionists = drs_met_geldig_onderdeel.groupby('Onderdeel')
                 for onderdeel_naam, onderdeel_group_df in grouped_receptionists:
                     onderdeel_safe_name = re.sub(r'\\W+', '_', onderdeel_naam)
-
                     with st.expander(f"Onderdeel: {onderdeel_naam}"):
                         dot_onderdeel = graphviz.Digraph(name=f'Flow_Onderdeel_{onderdeel_safe_name}', comment=f'Call Flow for Onderdeel {onderdeel_naam}')
                         dot_onderdeel.attr(rankdir='LR', size='25,25!', ranksep='0.8', nodesep='0.6', overlap='prism', splines='spline')
                         dot_onderdeel.attr('node', shape='box', style='rounded,filled', fontname='Arial', fontsize='9')
                         dot_onderdeel.attr('edge', fontname='Arial', fontsize='8')
-                        added_nodes_onderdeel = set() # Reset voor deze grafiek
+                        added_nodes_onderdeel = set()
                         added_edges_onderdeel = set()
-
+                        
                         # --- Teken de flow voor het Onderdeel (gebruik refactored helpers) ---
                         onderdeel_node_id = make_node_id_refactored("ONDERDEEL", onderdeel_safe_name, onderdeel_safe_name)
                         create_or_get_node_refactored(dot_onderdeel, onderdeel_node_id, f"🏢 Onderdeel:\\n{onderdeel_naam}", added_nodes_onderdeel, shape='tab', fillcolor='lightblue')
@@ -576,14 +591,17 @@ if all_data:
                         if start_drs_df.empty:
                              st.warning(f"Geen DRs gevonden voor onderdeel '{onderdeel_naam}' in deze groep.")
                              continue
-
+                        
+                        # Loop over start DRs binnen dit onderdeel
                         for _, dr in start_drs_df.iterrows():
+                           # ... (Volledige logica voor het tekenen van de flow voor één DR binnen het onderdeel,
+                           #      inclusief menu-opties, timeouts, tijdchecks, en aanroepen naar draw_destination_refactored
+                           #      blijft hier binnen deze for-loop, correct ge-indent) ...
                             dr_name = dr.get("Digital Receptionist Name", "Naamloos")
                             dr_ext = dr.get("Virtual Extension Number", "GEEN_EXT")
                             if dr_ext == "GEEN_EXT" or pd.isna(dr_ext): continue
                             dr_ext_str = str(dr_ext)
-                            context_id = f"{onderdeel_safe_name}_{dr_ext_str}" # Context voor nodes binnen deze DR flow
-
+                            context_id = f"{onderdeel_safe_name}_{dr_ext_str}"
                             menu_options_strings = {}
                             has_menu = False
                             for i in range(10):
@@ -591,44 +609,36 @@ if all_data:
                                 if menu_col in dr.index and pd.notna(dr[menu_col]) and str(dr[menu_col]).strip():
                                     menu_options_strings[i] = dr[menu_col]
                                     has_menu = True
-
                             ivr_timeout_sec_val = dr.get("If no input within seconds", None)
                             ivr_timeout_num = pd.to_numeric(ivr_timeout_sec_val, errors='coerce')
                             ivr_timeout_info = ""
                             if has_menu and pd.notna(ivr_timeout_num):
                                 ivr_timeout_info = f"\\nTimeout: {int(ivr_timeout_num)}s"
-
                             dr_node_id = make_node_id_refactored("DR", dr_ext_str, context_id)
                             dr_label = f"🚦 IVR: {dr_name}\\n({dr_ext_str}){ivr_timeout_info}"
                             _, dr_shape, dr_color, _ = get_node_label_and_style(dr_ext_str, "DR", all_data)
                             create_or_get_node_refactored(dot_onderdeel, dr_node_id, dr_label, added_nodes_onderdeel, shape=dr_shape, fillcolor=dr_color)
-
                             edge_key = (onderdeel_node_id, dr_node_id, start_label_prefix)
                             if edge_key not in added_edges_onderdeel:
                                  dot_onderdeel.edge(onderdeel_node_id, dr_node_id, label=start_label_prefix)
                                  added_edges_onderdeel.add(edge_key)
-
                             office_check_node_id = make_node_id_refactored("OFFICECHECK", dr_ext_str, context_id)
                             _, office_shape, office_color, _ = get_node_label_and_style("", "Check", all_data)
                             create_or_get_node_refactored(dot_onderdeel, office_check_node_id, "Binnen kantooruren?", added_nodes_onderdeel, shape=office_shape, fillcolor=office_color)
                             edge_key = (dr_node_id, office_check_node_id)
                             if edge_key not in added_edges_onderdeel: dot_onderdeel.edge(dr_node_id, office_check_node_id); added_edges_onderdeel.add(edge_key)
-
                             break_check_node_id = make_node_id_refactored("BREAKCHECK", dr_ext_str, context_id)
                             create_or_get_node_refactored(dot_onderdeel, break_check_node_id, "Pauze actief?", added_nodes_onderdeel, shape=office_shape, fillcolor=office_color)
                             edge_key = (office_check_node_id, break_check_node_id, "Ja")
                             if edge_key not in added_edges_onderdeel: dot_onderdeel.edge(office_check_node_id, break_check_node_id, label="Ja"); added_edges_onderdeel.add(edge_key)
-
                             holiday_check_node_id = make_node_id_refactored("HOLIDAYCHECK", dr_ext_str, context_id)
                             create_or_get_node_refactored(dot_onderdeel, holiday_check_node_id, "Vakantie actief?", added_nodes_onderdeel, shape=office_shape, fillcolor=office_color)
                             edge_key = (break_check_node_id, holiday_check_node_id, "Nee")
                             if edge_key not in added_edges_onderdeel: dot_onderdeel.edge(break_check_node_id, holiday_check_node_id, label="Nee"); added_edges_onderdeel.add(edge_key)
-
                             in_hours_node_id = make_node_id_refactored("INHOURS", dr_ext_str, context_id)
                             create_or_get_node_refactored(dot_onderdeel, in_hours_node_id, "Actie binnen kantooruren", added_nodes_onderdeel, shape='ellipse', fillcolor='lightgrey')
                             edge_key = (holiday_check_node_id, in_hours_node_id, "Nee")
                             if edge_key not in added_edges_onderdeel: dot_onderdeel.edge(holiday_check_node_id, in_hours_node_id, label="Nee"); added_edges_onderdeel.add(edge_key)
-
                             dest_strings = {
                                 'closed': dr.get("When office is closed route to", np.nan),
                                 'break': dr.get("When on break route to", np.nan),
@@ -636,8 +646,7 @@ if all_data:
                                 'default': dr.get("Send call to", np.nan),
                                 'invalid': dr.get("Invalid input destination", np.nan)
                             }
-                            # Gebruik refactored draw_destination met context_id
-                            draw_destination_refactored(dot_onderdeel, office_check_node_id, "Nee", dest_strings['closed'], all_data, context_id, added_nodes_onderdeel, added_edges_onderdeel, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Check", "OFFICECHECK")])) # Start diepte 1, initieel pad bezocht
+                            draw_destination_refactored(dot_onderdeel, office_check_node_id, "Nee", dest_strings['closed'], all_data, context_id, added_nodes_onderdeel, added_edges_onderdeel, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Check", "OFFICECHECK")]))
                             draw_destination_refactored(dot_onderdeel, break_check_node_id, "Ja", dest_strings['break'], all_data, context_id, added_nodes_onderdeel, added_edges_onderdeel, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Check", "BREAKCHECK")]))
                             holiday_type, _ = parse_destination(dest_strings['holiday'])
                             if holiday_type:
@@ -647,55 +656,55 @@ if all_data:
                                 if edge_key not in added_edges_onderdeel:
                                     dot_onderdeel.edge(holiday_check_node_id, in_hours_node_id, label="Ja (geen route)")
                                     added_edges_onderdeel.add(edge_key)
-
                             ivr_timeout_edge_label_part = f" ({int(ivr_timeout_num)}s)" if pd.notna(ivr_timeout_num) else ""
-
                             if has_menu:
-                                create_or_get_node_refactored(dot_onderdeel, in_hours_node_id, "🎶 Menu speelt...", added_nodes_onderdeel) # Update label if it exists
+                                create_or_get_node_refactored(dot_onderdeel, in_hours_node_id, "🎶 Menu speelt...", added_nodes_onderdeel)
                                 for key, dest_str in menu_options_strings.items():
                                     draw_destination_refactored(dot_onderdeel, in_hours_node_id, f"Kies {key}", dest_str, all_data, context_id, added_nodes_onderdeel, added_edges_onderdeel, depth=1, max_depth=10, visited_paths=set([(dr_node_id, f"Menu {key}", f"Menu {key}")]))
-
                                 timeout_edge_label = f"Timeout{ivr_timeout_edge_label_part} /\\nGeen invoer"
                                 draw_destination_refactored(dot_onderdeel, in_hours_node_id, timeout_edge_label, dest_strings['default'], all_data, context_id, added_nodes_onderdeel, added_edges_onderdeel, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Timeout/Default", f"Timeout{ivr_timeout_edge_label_part}")]))
-
                                 if pd.notna(dest_strings['invalid']) and dest_strings['invalid'] != dest_strings['default']:
                                      draw_destination_refactored(dot_onderdeel, in_hours_node_id, "Invalid", dest_strings['invalid'], all_data, context_id, added_nodes_onderdeel, added_edges_onderdeel, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Invalid Input", f"Invalid {dest_strings['invalid']}")]))
-
-                            else: # Geen menu
+                            else: 
                                 create_or_get_node_refactored(dot_onderdeel, in_hours_node_id, "Geen menu", added_nodes_onderdeel)
                                 draw_destination_refactored(dot_onderdeel, in_hours_node_id, "Direct", dest_strings['default'], all_data, context_id, added_nodes_onderdeel, added_edges_onderdeel, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Direct", f"Direct {dest_strings['default']}")]))
-
-                        # Toon grafiek voor dit onderdeel
+                        
+                        # Toon grafiek voor onderdeel (na de for-loop over DRs)
                         try:
                             st.graphviz_chart(dot_onderdeel, use_container_width=True)
                         except Exception as e:
                             st.error(f"Fout genereren grafiek voor onderdeel '{onderdeel_naam}': {e}")
                             st.code(dot_onderdeel.source, language='dot')
-            else:
-                st.info("Geen Digital Receptionists met een geldig Onderdeel gevonden.")
+            # Einde van: if not drs_met_geldig_onderdeel.empty:
+            elif not drs_zonder_geldig_onderdeel.empty: # Alleen tonen als er *wel* ongeldige zijn maar *geen* geldige
+                st.info("Geen Digital Receptionists met een geldig Onderdeel gevonden. Controleer individuele flows hieronder.")
 
             # --- 2. Genereer Flows per Individuele DR (zonder geldig onderdeel) ---
+            # Dit blok staat nu op hetzelfde niveau als het 'if not drs_met_geldig_onderdeel.empty:' blok
             if not drs_zonder_geldig_onderdeel.empty:
                 st.divider()
                 st.header("Individuele Call Flows (Geen/Ongeldig Onderdeel)")
                 st.write("Flows voor Digital Receptionists zonder specifiek onderdeel of met '?' als onderdeel.")
 
+                # Loop over DRs zonder geldig onderdeel
                 for _, dr in drs_zonder_geldig_onderdeel.iterrows():
+                    # Deze code moet correct ge-indent zijn binnen deze for-loop
                     dr_name = dr.get("Digital Receptionist Name", "Naamloos")
                     dr_ext = dr.get("Virtual Extension Number", "GEEN_EXT")
                     if dr_ext == "GEEN_EXT" or pd.isna(dr_ext): continue
                     dr_ext_str = str(dr_ext)
-                    context_id = dr_ext_str # Context is de DR extensie zelf
+                    context_id = dr_ext_str 
 
                     with st.expander(f"Individuele IVR: {dr_name} ({dr_ext_str})"):
                         dot_individual = graphviz.Digraph(name=f'Flow_Indiv_{dr_ext_str}', comment=f'Individual Call Flow for {dr_name}')
                         dot_individual.attr(rankdir='LR', size='25,25!', ranksep='0.8', nodesep='0.6', overlap='prism', splines='spline')
                         dot_individual.attr('node', shape='box', style='rounded,filled', fontname='Arial', fontsize='9')
                         dot_individual.attr('edge', fontname='Arial', fontsize='8')
-                        added_nodes_indiv = set() # Reset voor deze grafiek
+                        added_nodes_indiv = set()
                         added_edges_indiv = set()
 
-                        # --- Teken flow voor deze individuele DR (vergelijkbaar met onderdeel-loop, maar start bij DR) ---
+                        # ... (Logica voor tekenen flow individuele DR, vergelijkbaar met binnen onderdeel-loop,
+                        #      maar startend bij dr_node_id, correct ge-indent binnen deze with-expander) ...
                         menu_options_strings = {}
                         has_menu = False
                         for i in range(10):
@@ -703,42 +712,32 @@ if all_data:
                             if menu_col in dr.index and pd.notna(dr[menu_col]) and str(dr[menu_col]).strip():
                                 menu_options_strings[i] = dr[menu_col]
                                 has_menu = True
-
                         ivr_timeout_sec_val = dr.get("If no input within seconds", None)
                         ivr_timeout_num = pd.to_numeric(ivr_timeout_sec_val, errors='coerce')
                         ivr_timeout_info = ""
                         if has_menu and pd.notna(ivr_timeout_num):
                             ivr_timeout_info = f"\\nTimeout: {int(ivr_timeout_num)}s"
-
-                        # Start node is de DR zelf
                         dr_node_id = make_node_id_refactored("DR", dr_ext_str, context_id)
                         dr_label = f"🚦 IVR: {dr_name}\\n({dr_ext_str}){ivr_timeout_info}"
                         _, dr_shape, dr_color, _ = get_node_label_and_style(dr_ext_str, "DR", all_data)
                         create_or_get_node_refactored(dot_individual, dr_node_id, dr_label, added_nodes_indiv, shape=dr_shape, fillcolor=dr_color)
-
-                        # Tijd checks (direct gekoppeld aan DR node)
                         office_check_node_id = make_node_id_refactored("OFFICECHECK", dr_ext_str, context_id)
                         _, office_shape, office_color, _ = get_node_label_and_style("", "Check", all_data)
                         create_or_get_node_refactored(dot_individual, office_check_node_id, "Binnen kantooruren?", added_nodes_indiv, shape=office_shape, fillcolor=office_color)
                         edge_key = (dr_node_id, office_check_node_id)
                         if edge_key not in added_edges_indiv: dot_individual.edge(dr_node_id, office_check_node_id); added_edges_indiv.add(edge_key)
-
                         break_check_node_id = make_node_id_refactored("BREAKCHECK", dr_ext_str, context_id)
                         create_or_get_node_refactored(dot_individual, break_check_node_id, "Pauze actief?", added_nodes_indiv, shape=office_shape, fillcolor=office_color)
                         edge_key = (office_check_node_id, break_check_node_id, "Ja")
                         if edge_key not in added_edges_indiv: dot_individual.edge(office_check_node_id, break_check_node_id, label="Ja"); added_edges_indiv.add(edge_key)
-
                         holiday_check_node_id = make_node_id_refactored("HOLIDAYCHECK", dr_ext_str, context_id)
                         create_or_get_node_refactored(dot_individual, holiday_check_node_id, "Vakantie actief?", added_nodes_indiv, shape=office_shape, fillcolor=office_color)
                         edge_key = (break_check_node_id, holiday_check_node_id, "Nee")
                         if edge_key not in added_edges_indiv: dot_individual.edge(break_check_node_id, holiday_check_node_id, label="Nee"); added_edges_indiv.add(edge_key)
-
                         in_hours_node_id = make_node_id_refactored("INHOURS", dr_ext_str, context_id)
                         create_or_get_node_refactored(dot_individual, in_hours_node_id, "Actie binnen kantooruren", added_nodes_indiv, shape='ellipse', fillcolor='lightgrey')
                         edge_key = (holiday_check_node_id, in_hours_node_id, "Nee")
                         if edge_key not in added_edges_indiv: dot_individual.edge(holiday_check_node_id, in_hours_node_id, label="Nee"); added_edges_indiv.add(edge_key)
-
-                        # Bestemmingen en routes (zelfde logica als voorheen, gebruik refactored helpers)
                         dest_strings = {
                             'closed': dr.get("When office is closed route to", np.nan),
                             'break': dr.get("When on break route to", np.nan),
@@ -756,32 +755,31 @@ if all_data:
                             if edge_key not in added_edges_indiv:
                                 dot_individual.edge(holiday_check_node_id, in_hours_node_id, label="Ja (geen route)")
                                 added_edges_indiv.add(edge_key)
-
                         ivr_timeout_edge_label_part = f" ({int(ivr_timeout_num)}s)" if pd.notna(ivr_timeout_num) else ""
-
                         if has_menu:
                             create_or_get_node_refactored(dot_individual, in_hours_node_id, "🎶 Menu speelt...", added_nodes_indiv)
                             for key, dest_str in menu_options_strings.items():
                                 draw_destination_refactored(dot_individual, in_hours_node_id, f"Kies {key}", dest_str, all_data, context_id, added_nodes_indiv, added_edges_indiv, depth=1, max_depth=10, visited_paths=set([(dr_node_id, f"Menu {key}", f"Menu {key}")]))
-
                             timeout_edge_label = f"Timeout{ivr_timeout_edge_label_part} /\\nGeen invoer"
                             draw_destination_refactored(dot_individual, in_hours_node_id, timeout_edge_label, dest_strings['default'], all_data, context_id, added_nodes_indiv, added_edges_indiv, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Timeout/Default", f"Timeout{ivr_timeout_edge_label_part}")]))
-
                             if pd.notna(dest_strings['invalid']) and dest_strings['invalid'] != dest_strings['default']:
                                  draw_destination_refactored(dot_individual, in_hours_node_id, "Invalid", dest_strings['invalid'], all_data, context_id, added_nodes_indiv, added_edges_indiv, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Invalid Input", f"Invalid {dest_strings['invalid']}")]))
-
-                        else: # Geen menu
+                        else:
                             create_or_get_node_refactored(dot_individual, in_hours_node_id, "Geen menu", added_nodes_indiv)
                             draw_destination_refactored(dot_individual, in_hours_node_id, "Direct", dest_strings['default'], all_data, context_id, added_nodes_indiv, added_edges_indiv, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Direct", f"Direct {dest_strings['default']}")]))
 
-                        # Toon grafiek voor deze individuele DR
+                        # Toon grafiek (binnen with expander)
                         try:
                             st.graphviz_chart(dot_individual, use_container_width=True)
                         except Exception as e:
                             st.error(f"Fout genereren grafiek voor IVR '{dr_name}' ({dr_ext_str}): {e}")
                             st.code(dot_individual.source, language='dot')
-            elif drs_met_geldig_onderdeel.empty: # Alleen tonen als er *ook* geen geldige zijn
-                 st.info("Geen Digital Receptionists zonder geldig Onderdeel gevonden om individueel weer te geven.")
+            # Einde van: if not drs_zonder_geldig_onderdeel.empty:
+            # Voeg eventueel een melding toe als er helemaal geen DRs zijn
+            elif not drs_met_geldig_onderdeel.empty: # Alleen als er wel geldige waren
+                 st.info("Geen individuele DRs (zonder geldig onderdeel) gevonden.")
+            else: # Geen enkele DR gevonden
+                 st.warning("Er zijn helemaal geen Digital Receptionists gevonden in de data.")
 
     # --- Tab 2: Users per Onderdeel ---
     with tab2:
@@ -837,6 +835,7 @@ if all_data:
                                 str(user_info.get('DID', '')),
                                 str(user_info.get('OutboundCallerID', '')),
                                 str(user_info.get('MobileNumber', '')),
+                                str(user_info.get('EmailAddress', '')),
                                 did_blokken_str,
                                 outbound_blok_str
                             ))
@@ -863,6 +862,7 @@ if all_data:
                                                 str(user_info.get('DID', '')),
                                                 str(user_info.get('OutboundCallerID', '')),
                                                 str(user_info.get('MobileNumber', '')),
+                                                str(user_info.get('EmailAddress', '')),
                                                 did_blokken_str,
                                                 outbound_blok_str
                                           ))
@@ -890,6 +890,7 @@ if all_data:
                                                  str(user_info.get('DID', '')),
                                                  str(user_info.get('OutboundCallerID', '')),
                                                  str(user_info.get('MobileNumber', '')),
+                                                 str(user_info.get('EmailAddress', '')),
                                                  did_blokken_str,
                                                  outbound_blok_str
                                            ))
@@ -944,7 +945,7 @@ if all_data:
                 
                 reachable_users_tuples = find_reachable_users(start_destinations_for_onderdeel, all_data)
                 
-                for user_num, user_name, user_dep, did_str, cid, mobile, did_blokken_str, outbound_blok_str in reachable_users_tuples:
+                for user_num, user_name, user_dep, did_str, cid, mobile, email, did_blokken_str, outbound_blok_str in reachable_users_tuples:
                      users_per_onderdeel_data.append({
                          "Onderdeel": onderdeel,
                          "User Number": user_num,
@@ -953,36 +954,27 @@ if all_data:
                          "DID": did_str,
                          "Outbound CID": cid,
                          "Mobile": mobile,
+                         "Email": email,
                          "Nummerblok(ken) DID": did_blokken_str,
                          "Nummerblok OutboundCID": outbound_blok_str
                      })
                 progress_bar.progress((i + 1) / total_onderdelen_met_drs)
             
-            # --- DEBUG START ---
-            st.subheader("Debug Info: Ruwe Resultaten (Tab 2)")
-            st.write(f"Aantal gevonden gebruiker-tuples (voor alle onderdelen): {len(users_per_onderdeel_data)}")
-            if users_per_onderdeel_data:
-                st.write("Voorbeeld eerste tuple:", users_per_onderdeel_data[0])
-            # --- DEBUG END ---
+            # Initialiseer DataFrame *voor* de check, met de juiste kolommen
+            users_per_onderdeel_df = pd.DataFrame(columns=[
+                "Onderdeel", "User Number", "User Name", "Department", "DID", 
+                "Outbound CID", "Mobile", "Email", "Nummerblok(ken) DID", "Nummerblok OutboundCID"
+            ])
             
-            # Bouw initiële DataFrame
+            # Bouw DataFrame als er data is
             if users_per_onderdeel_data:
+                 # Overschrijf de lege DataFrame met de gevonden data
                  users_per_onderdeel_df = pd.DataFrame(users_per_onderdeel_data)
-                 # --- DEBUG START ---
-                 st.write("DataFrame gemaakt vanuit tuples. Shape:", users_per_onderdeel_df.shape)
-                 st.write("Head van initiële DataFrame:")
-                 st.dataframe(users_per_onderdeel_df.head())
-                 st.write("Nummerblok kolommen (head):")
-                 st.dataframe(users_per_onderdeel_df[['Nummerblok(ken) DID', 'Nummerblok OutboundCID']].head())
-                 # --- DEBUG END ---
-            else:
-                 users_per_onderdeel_df = pd.DataFrame(columns=["Onderdeel", "User Number", "User Name", "Department", "DID", "Outbound CID", "Mobile", "Nummerblok(ken) DID", "Nummerblok OutboundCID"])
-                 # --- DEBUG START ---
-                 st.write("Geen gebruikersdata gevonden, lege DataFrame gemaakt.")
-                 # --- DEBUG END ---
-                 
+            # De else-tak is niet meer nodig, users_per_onderdeel_df is al leeg geïnitialiseerd.
+             
             # --- Voeg ontbrekende onderdelen toe --- 
             # Gebruik de lijst van *alle* geldige onderdelen die eerder is bepaald
+            # users_per_onderdeel_df bestaat nu gegarandeerd.
             onderdelen_in_df = set(users_per_onderdeel_df['Onderdeel'].unique())
             missing_onderdelen = set(alle_geldige_onderdelen_namen) - onderdelen_in_df
             
@@ -992,7 +984,7 @@ if all_data:
                       placeholder_data.append({
                           "Onderdeel": missing_ond,
                           "User Number": "", "User Name": "(Geen bereikbare users)", "Department": "", 
-                          "DID": "", "Outbound CID": "", "Mobile": "", 
+                          "DID": "", "Outbound CID": "", "Mobile": "", "Email": "",
                           "Nummerblok(ken) DID": "", "Nummerblok OutboundCID": ""
                       })
                  missing_df = pd.DataFrame(placeholder_data)
@@ -1003,6 +995,7 @@ if all_data:
             users_per_onderdeel_df['Department'] = users_per_onderdeel_df['Department'].astype(str)
             users_per_onderdeel_df['Nummerblok(ken) DID'] = users_per_onderdeel_df['Nummerblok(ken) DID'].astype(str)
             users_per_onderdeel_df['Nummerblok OutboundCID'] = users_per_onderdeel_df['Nummerblok OutboundCID'].astype(str)
+            users_per_onderdeel_df['Email'] = users_per_onderdeel_df['Email'].astype(str)
             # Sorteer de *complete* dataframe
             users_per_onderdeel_df = users_per_onderdeel_df.sort_values(by=["Onderdeel", "User Name"])
 
@@ -1035,9 +1028,9 @@ if all_data:
                 
             # Toon de gefilterde dataframe
             st.dataframe(filtered_df, use_container_width=True, 
-                             column_order=["User Name", "User Number", "User Department", "Nummerblok(ken) DID", "Nummerblok OutboundCID", "Reached Via Type", "Reached Via Name", "Reached Via Ext", "Onderdeel"])
+                             column_order=["Onderdeel", "User Name", "User Number", "Department", "Mobile", "Email", "DID", "Outbound CID", "Nummerblok(ken) DID", "Nummerblok OutboundCID"])
 
-    # --- Tab 3: DRs per User (OPNIEUW TOEGEVOEGD) ---
+    # --- Tab 3: DRs per User ---
     with tab3:
         st.header("Overzicht: Welke DRs/Queues/RGs leiden naar welke User?")
         
@@ -1104,6 +1097,10 @@ if all_data:
                                     "User Number": potential_user_ext,
                                     "User Name": user_info.get('Naam', f'User {potential_user_ext}'),
                                     "User Department": str(department),
+                                    "Mobile": str(user_info.get('MobileNumber', '')),
+                                    "Email": str(user_info.get('EmailAddress', '')),
+                                    "DID": str(user_info.get('DID', '')),
+                                    "Outbound CID": str(user_info.get('OutboundCallerID', '')),
                                     "Reached Via Type": "DR",
                                     "Reached Via Name": dr_name,
                                     "Reached Via Ext": dr_ext,
@@ -1131,6 +1128,10 @@ if all_data:
                                                     "User Number": user_info.get('Number', 'N/A'),
                                                     "User Name": user_name_in_queue,
                                                     "User Department": str(department),
+                                                    "Mobile": str(user_info.get('MobileNumber', '')),
+                                                    "Email": str(user_info.get('EmailAddress', '')),
+                                                    "DID": str(user_info.get('DID', '')),
+                                                    "Outbound CID": str(user_info.get('OutboundCallerID', '')),
                                                     "Reached Via Type": "Queue",
                                                     "Reached Via Name": queue_name,
                                                     "Reached Via Ext": queue_ext,
@@ -1158,6 +1159,10 @@ if all_data:
                                                      "User Number": user_info.get('Number', 'N/A'),
                                                      "User Name": user_name_in_rg,
                                                      "User Department": str(department),
+                                                     "Mobile": str(user_info.get('MobileNumber', '')),
+                                                     "Email": str(user_info.get('EmailAddress', '')),
+                                                     "DID": str(user_info.get('DID', '')),
+                                                     "Outbound CID": str(user_info.get('OutboundCallerID', '')),
                                                      "Reached Via Type": "RingGroup",
                                                      "Reached Via Name": rg_name,
                                                      "Reached Via Ext": rg_ext,
@@ -1169,49 +1174,73 @@ if all_data:
                 
                 progress_bar.empty()
                 if not results:
-                    return pd.DataFrame()
+                    # Return empty DataFrame with ALL columns specified
+                    return pd.DataFrame(columns=[
+                         "User Name", "User Number", "User Department", "Mobile", "Email", "DID", "Outbound CID",
+                         "Reached Via Type", "Reached Via Name", "Reached Via Ext", "Onderdeel",
+                         "Nummerblok(ken) DID", "Nummerblok OutboundCID"
+                    ])
+
                 df = pd.DataFrame(results)
-                df['User Department'] = df['User Department'].astype(str)
-                df['Nummerblok(ken) DID'] = df['Nummerblok(ken) DID'].astype(str)
-                df['Nummerblok OutboundCID'] = df['Nummerblok OutboundCID'].astype(str)
+                # Ensure all relevant columns are string type before sorting/dropping duplicates
+                for col in ["User Department", "Mobile", "Email", "DID", "Outbound CID", "Nummerblok(ken) DID", "Nummerblok OutboundCID"]:
+                     if col in df.columns: # Check if column exists before conversion
+                          df[col] = df[col].astype(str)
                 df = df.drop_duplicates().sort_values(by=["User Name", "Onderdeel", "Reached Via Type", "Reached Via Name"])
                 return df
             
-            # Bouw de data en toon de tabel
-            drs_per_user_df = build_user_reachability_data(all_data)
-
+            # Bouw de data 
+            drs_per_user_df_raw = build_user_reachability_data(all_data)
+            
+            # Initialiseer DataFrame *altijd* met de juiste kolommen
+            drs_per_user_df = pd.DataFrame(drs_per_user_df_raw, columns=[
+                "User Name", "User Number", "User Department", "Mobile", "Email", "DID", "Outbound CID",
+                "Nummerblok(ken) DID", "Nummerblok OutboundCID", 
+                "Reached Via Type", "Reached Via Name", "Reached Via Ext", "Onderdeel"
+            ])
+            # Zorg dat string kolommen ook echt string zijn, zelfs als DF leeg is
+            for col in ["User Department", "Mobile", "Email", "DID", "Outbound CID", "Nummerblok(ken) DID", "Nummerblok OutboundCID", "Onderdeel", "Reached Via Type"]: 
+                if col in drs_per_user_df.columns:
+                     drs_per_user_df[col] = drs_per_user_df[col].astype(str)
+            
+            # Controleer daarna of de dataframe leeg is
             if drs_per_user_df.empty:
                 st.info("Geen gebruikers gevonden die bereikt worden via Digital Receptionists, Queues of Ring Groups.")
             else:
                 st.subheader("Filter Opties")
+                # Filters gebruiken nu de gegarandeerd bestaande (mogelijk lege) DataFrame
                 unique_users = sorted(drs_per_user_df['User Name'].astype(str).unique())
                 selected_users = st.multiselect("Filter op Gebruiker:", unique_users, default=[])
+                # ... (rest van de filter definities ongewijzigd) ...
                 unique_departments = sorted(drs_per_user_df['User Department'].unique())
                 selected_departments = st.multiselect("Filter op Afdeling:", unique_departments, default=[])
-                unique_onderdelen = sorted(drs_per_user_df['Onderdeel'].astype(str).unique())
+                unique_onderdelen = sorted(drs_per_user_df['Onderdeel'].unique())
                 selected_onderdelen = st.multiselect("Filter op Onderdeel:", unique_onderdelen, default=[])
-                unique_types = sorted(drs_per_user_df['Reached Via Type'].astype(str).unique())
+                unique_types = sorted(drs_per_user_df['Reached Via Type'].unique())
                 selected_types = st.multiselect("Filter op Bereikt Via Type:", unique_types, default=[])
-                
-                # --- Filters voor Nummerblokken --- 
                 unique_did_blokken = sorted(drs_per_user_df[drs_per_user_df['Nummerblok(ken) DID'] != '']['Nummerblok(ken) DID'].unique())
                 selected_did_blokken = st.multiselect("Filter op Nummerblok DID:", unique_did_blokken, default=[])
-                
                 unique_outbound_blokken = sorted(drs_per_user_df[drs_per_user_df['Nummerblok OutboundCID'] != '']['Nummerblok OutboundCID'].unique())
                 selected_outbound_blokken = st.multiselect("Filter op Nummerblok Outbound CID:", unique_outbound_blokken, default=[])
-                # --- Einde Filters --- 
-
-                # Pas filters toe (inclusief nummerblokken)
+                
+                # Pas filters toe
                 filtered_df = drs_per_user_df.copy()
+                # ... (filter toepassingslogica ongewijzigd) ...
                 if selected_users: filtered_df = filtered_df[filtered_df['User Name'].isin(selected_users)]
                 if selected_departments: filtered_df = filtered_df[filtered_df['User Department'].isin(selected_departments)]
                 if selected_onderdelen: filtered_df = filtered_df[filtered_df['Onderdeel'].isin(selected_onderdelen)]
                 if selected_types: filtered_df = filtered_df[filtered_df['Reached Via Type'].isin(selected_types)]
                 if selected_did_blokken: filtered_df = filtered_df[filtered_df['Nummerblok(ken) DID'].isin(selected_did_blokken)] 
                 if selected_outbound_blokken: filtered_df = filtered_df[filtered_df['Nummerblok OutboundCID'].isin(selected_outbound_blokken)] 
-
+                
                 st.dataframe(filtered_df, use_container_width=True, 
-                             column_order=["User Name", "User Number", "User Department", "Nummerblok(ken) DID", "Nummerblok OutboundCID", "Reached Via Type", "Reached Via Name", "Reached Via Ext", "Onderdeel"])
+                             column_order=[ # Updated column order
+                                 "User Name", "User Number", "User Department", 
+                                 "Mobile", "Email", "DID", "Outbound CID", 
+                                 "Nummerblok(ken) DID", "Nummerblok OutboundCID", 
+                                 "Reached Via Type", "Reached Via Name", "Reached Via Ext", 
+                                 "Onderdeel" 
+                             ])
 
 else:
     st.info("Wacht op upload van ZIP-bestand...")
