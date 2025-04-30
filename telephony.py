@@ -10,15 +10,46 @@ import io
 # Pagina configuratie
 st.set_page_config(layout="wide")
 
+# --- Helper Functies ---
+def normalize_nl_number(number_str):
+    """Probeert een NL telefoonnummer string te normaliseren naar een integer format (bv. 3188...)."""
+    if pd.isna(number_str) or not isinstance(number_str, str):
+        return None
+    
+    # Verwijder veelvoorkomende tekens: +, *, spaties, (0)
+    cleaned_number = number_str.replace("+", "").replace("*", "").replace(" ", "").replace("(0)", "")
+    
+    # Specifieke NL logica
+    if cleaned_number.startswith('0'):
+        # Vervang leidende 0 door 31 (aanname NL nummer)
+        normalized = "31" + cleaned_number[1:]
+    elif cleaned_number.startswith('31'):
+        # Heeft al landcode
+        normalized = cleaned_number
+    else:
+        # Geen duidelijke NL prefix, kan geen landcode toevoegen. 
+        # Misschien is het al een nummer zonder landcode of een buitenlands nummer?
+        # Voor nu: retourneer zoals het is als het alleen cijfers zijn, anders None
+        if cleaned_number.isdigit():
+             normalized = cleaned_number # Behandel als mogelijk lokaal nummer of extensie
+        else:
+             return None # Kan niet converteren
+
+    # Converteer naar integer indien mogelijk
+    try:
+        return int(normalized)
+    except (ValueError, TypeError):
+        return None
+
 # --- Data laad functie (uit ZIP) ---
 @st.cache_data
 def load_data_from_zip(zip_file_bytes):
-    # (Functie ongewijzigd t.o.v. vorige ZIP versie)
     data = {}
     required_files = {
         "receptionists": "Receptionists.csv", "queues": "Queues.csv",
         "ringgroups": "ringgroups.csv", "users": "Users.csv",
         "trunks": "Trunks.csv",
+        "trunksreeksen": "trunksreeksen.csv"
     }
     all_files_found = True; loaded_files = []; missing_files = []
     try:
@@ -30,20 +61,50 @@ def load_data_from_zip(zip_file_bytes):
                     if actual_zip_path:
                         try:
                             try: df = pd.read_csv(zf.open(actual_zip_path), delimiter=";")
-                            except: df = pd.read_csv(zf.open(actual_zip_path), delimiter=",")
-                            data[key] = df; loaded_files.append(filename)
-                        except Exception as e: st.error(f"Kon {filename} niet lezen uit ZIP: {e}"); all_files_found = False # Essentieel?
-                else:
+                            except Exception as e_semi:
+                                try: 
+                                    df = pd.read_csv(zf.open(actual_zip_path), delimiter=",")
+                                except Exception as e_comma:
+                                    st.error(f"Kon {filename} niet lezen met ';' of ',': {e_comma} (oorspronkelijke fout: {e_semi})")
+                                    df = None
+                                    if key == "trunksreeksen": st.warning(f"Optioneel bestand {filename} kon niet worden gelezen.")
+                                    else: all_files_found = False 
+                            
+                            if df is not None:
+                                data[key] = df
+                                loaded_files.append(filename)
+                        except Exception as e_outer:
+                             st.error(f"Onverwachte fout bij lezen {filename}: {e_outer}")
+                             if key != "trunksreeksen": all_files_found = False 
+                elif key != "trunksreeksen":
                     missing_files.append(filename);
                     if key in ["receptionists", "queues", "ringgroups", "users"]: all_files_found = False
+            
+            if "trunksreeksen.csv" in zip_base_filenames and "trunksreeksen" not in data:
+                 st.warning("Bestand trunksreeksen.csv is aanwezig in ZIP, maar kon niet worden ingelezen.")
+
         if not all_files_found: st.error(f"Essentiële bestanden missen: {', '.join(missing_files)}"); return None
 
         # Data Voorbereiding
-        if "receptionists" in data and 'Virtual Extension Number' in data['receptionists'].columns:
-            data['receptionists']['Virtual Extension Number'] = data['receptionists']['Virtual Extension Number'].astype(str)
-            data["receptionists_primary"] = data["receptionists"][data["receptionists"]["Primair/Secundair"] == "Primair"].copy()
-            data["receptionists_all"] = data["receptionists"].copy()
-        else: data["receptionists_primary"], data["receptionists_all"] = pd.DataFrame(), pd.DataFrame()
+        if "receptionists" in data:
+            receptionists_df = data['receptionists']
+            if receptionists_df.shape[1] > 0:
+                first_col_name = receptionists_df.columns[0]
+                if first_col_name != 'Onderdeel':
+                    st.info(f"Eerste kolom '{first_col_name}' in Receptionists.csv wordt gebruikt als 'Onderdeel'.")
+                    receptionists_df = receptionists_df.rename(columns={first_col_name: 'Onderdeel'})
+                    data['receptionists'] = receptionists_df
+            
+            if 'Virtual Extension Number' in receptionists_df.columns:
+                 receptionists_df['Virtual Extension Number'] = receptionists_df['Virtual Extension Number'].astype(str)
+            if "Primair/Secundair" in receptionists_df.columns:
+                 data["receptionists_primary"] = receptionists_df[receptionists_df["Primair/Secundair"] == "Primair"].copy()
+            else: data["receptionists_primary"] = pd.DataFrame()
+            data["receptionists_all"] = receptionists_df.copy()
+        else: 
+            data["receptionists_primary"], data["receptionists_all"] = pd.DataFrame(), pd.DataFrame()
+            st.warning("Receptionists.csv niet gevonden of leeg.")
+            
         if "queues" in data and 'Virtual Extension Number' in data['queues'].columns: data['queues']['Virtual Extension Number'] = data['queues']['Virtual Extension Number'].astype(str)
         if "ringgroups" in data and 'Virtual Extension Number' in data['ringgroups'].columns: data['ringgroups']['Virtual Extension Number'] = data['ringgroups']['Virtual Extension Number'].astype(str)
         if "users" in data:
@@ -54,12 +115,81 @@ def load_data_from_zip(zip_file_bytes):
             if 'Full Name' in users.columns: users['Naam'] = users['Full Name']
             elif 'Naam' not in users.columns and 'FirstName' in users.columns: users['Naam'] = users['FirstName'].fillna('') + ' ' + users['LastName'].fillna(''); users['Naam'] = users['Naam'].str.strip()
             data['users'] = users
+        
+        # --- Creëer Nummerblok Range Mapping --- 
+        nummerblok_ranges = []
+        if "trunksreeksen" in data:
+            trunks_df = data["trunksreeksen"]
+            # Kolomnamen voor ranges (kunnen variëren)
+            range_start_cols = ['DID Number', 'DID nummer (E.136)', 'Startreeks'] 
+            range_end_col = 'Eindreeks' # Aanname, of uit bestandsnaam parsen?
+            nummerblok_col = 'Nummerblok'
+            
+            # Vind de daadwerkelijke startkolom
+            did_col_start = next((col for col in range_start_cols if col in trunks_df.columns), None)
+            
+            if did_col_start and nummerblok_col in trunks_df.columns:
+                trunks_df_clean = trunks_df.dropna(subset=[did_col_start, nummerblok_col])
+                
+                parsed_ranges = 0
+                for _, row in trunks_df_clean.iterrows():
+                    try:
+                        start_str = str(row[did_col_start])
+                        nummerblok = str(row[nummerblok_col])
+                        end_suffix_or_full = str(row.get(range_end_col, '')) # Optionele eindreeks kolom
+
+                        start_num_int = normalize_nl_number(start_str)
+                        if start_num_int is None: continue # Kan start niet normaliseren
+
+                        end_num_int = None
+                        if end_suffix_or_full.isdigit() and len(end_suffix_or_full) < 6: # Waarschijnlijk een suffix zoals 499
+                            start_prefix = str(start_num_int)[:-len(end_suffix_or_full)]
+                            end_str = start_prefix + end_suffix_or_full
+                            end_num_int = normalize_nl_number(end_str) # Normaliseer geconstrueerd nummer
+                        elif end_suffix_or_full: # Waarschijnlijk een volledig nummer
+                             end_num_int = normalize_nl_number(end_suffix_or_full)
+                        else: # Geen eindreeks, range is enkel nummer
+                            end_num_int = start_num_int
+                            
+                        if end_num_int is not None and end_num_int >= start_num_int:
+                            nummerblok_ranges.append((start_num_int, end_num_int, nummerblok))
+                            parsed_ranges += 1
+                        # else: Log warning over ongeldige range?
+
+                    except Exception as e_range: # Vang fouten tijdens parsen van een rij
+                        st.warning(f"Kon range niet parsen in trunksreeksen.csv rij: {row.to_dict()}, Fout: {e_range}")
+                
+                data["nummerblok_ranges"] = sorted(nummerblok_ranges) # Sorteer op startnummer
+                st.info(f"{parsed_ranges} nummerblok ranges succesvol geparsed.")
+            else:
+                missing_cols = []
+                if not did_col_start: missing_cols.append("Start range ('DID Number'/'DID nummer (E.136)'/'Startreeks')")
+                if nummerblok_col not in trunks_df.columns: missing_cols.append("'Nummerblok'")
+                st.warning(f"'trunksreeksen.csv' mist benodigde kolommen: {', '.join(missing_cols)}. Nummerblok info niet beschikbaar.")
+                data["nummerblok_ranges"] = [] # Lege lijst
+        else:
+            st.info("'trunksreeksen.csv' niet gevonden. Nummerblok info niet beschikbaar.")
+            data["nummerblok_ranges"] = [] # Lege lijst
+        # --- Einde Nummerblok Range Mapping --- 
+
         st.success(f"Succesvol geladen uit ZIP: {', '.join(loaded_files)}")
         return data
     except zipfile.BadZipFile: st.error("Ongeldig ZIP-bestand."); return None
     except Exception as e: st.error(f"Fout bij verwerken ZIP: {e}"); return None
 
-# --- Helper Functies ---
+# --- Nieuwe Helper voor Nummerblok Zoeken --- 
+def find_nummerblok_for_number(number_str, nummerblok_ranges):
+    """Zoekt het nummerblok voor een enkel, genormaliseerd nummer in de range lijst."""
+    normalized_num = normalize_nl_number(number_str)
+    if normalized_num is None or not nummerblok_ranges:
+        return None
+    
+    # TODO: Efficiënter zoeken indien gesorteerd (binary search)? Voor nu lineair.
+    for start, end, blok in nummerblok_ranges:
+        if start <= normalized_num <= end:
+            return blok
+    return None
+
 def parse_destination(dest_string):
     """
     Parseert een bestemming string uit de CSV's naar type en identifier.
@@ -222,7 +352,7 @@ all_data = None
 
 if uploaded_zip is not None:
     zip_content_bytes = uploaded_zip.getvalue()
-    all_data = load_data_from_zip(zip_content_bytes) # Functie van vorige versie
+    all_data = load_data_from_zip(zip_content_bytes)
 
 if all_data:
     # Gebruik alle receptionists, niet alleen primaire
@@ -250,43 +380,129 @@ if all_data:
              added_nodes_set.add(node_id)
          return node_id
 
-    def draw_destination_refactored(dot_graph, source_node_id, edge_label, dest_string, current_all_data, context, added_nodes_set, added_edges_set):
-        """Tekent een pijl naar een bestemming, inclusief 'no answer' routes."""
+    def draw_destination_refactored(dot_graph, source_node_id, edge_label, dest_string, current_all_data, context, added_nodes_set, added_edges_set, depth=0, max_depth=10, visited_paths=None):
+        """Tekent een pijl naar een bestemming en volgt recursief (met diepte limiet en cyclus detectie)."""
+        if depth > max_depth:
+            # Teken een speciale node om aan te geven dat max diepte is bereikt
+            max_depth_node_id = make_node_id_refactored("MAXDEPTH", f"{source_node_id}_{edge_label}", context)
+            create_or_get_node_refactored(dot_graph, max_depth_node_id, "Max Recursion Depth Reached", added_nodes_set, shape='octagon', fillcolor='orange')
+            edge_key = (source_node_id, max_depth_node_id, edge_label + " (max depth)")
+            if edge_key not in added_edges_set:
+                dot_graph.edge(source_node_id, max_depth_node_id, label=edge_label + " (max depth)")
+                added_edges_set.add(edge_key)
+            return # Stop recursie hier
+
+        if visited_paths is None:
+            visited_paths = set()
+
         dest_type, dest_id = parse_destination(dest_string)
-        # Gebruik de gerefactorde make_node_id met context
-        target_node_id = make_node_id_refactored("END", f"{source_node_id}_{edge_label.replace(' ','_').replace('/','_')}", context)
+        path_key = (source_node_id, dest_type, dest_id)
 
-        target_label, target_shape, target_color, target_node_type = get_node_label_and_style(None, "EndCall", current_all_data)
-        if dest_type:
-            target_node_id = make_node_id_refactored(f"DEST_{dest_type}", f"{dest_id}_{edge_label.replace(' ','_').replace('/','_')}", context)
-            target_label, target_shape, target_color, target_node_type = get_node_label_and_style(dest_id, dest_type, current_all_data)
+        # Basis geval: geen bestemming of al bezocht pad
+        if not dest_type:
+            target_label, target_shape, target_color, _ = get_node_label_and_style(None, "EndCall", current_all_data)
+            target_node_id = make_node_id_refactored("END", f"{source_node_id}_{edge_label}", context)
+            create_or_get_node_refactored(dot_graph, target_node_id, target_label, added_nodes_set, shape=target_shape, fillcolor=target_color)
+            edge_key = (source_node_id, target_node_id, edge_label)
+            if edge_key not in added_edges_set: dot_graph.edge(source_node_id, target_node_id, label=edge_label); added_edges_set.add(edge_key)
+            return
+        
+        if path_key in visited_paths:
+             # Teken pijl naar bestaande node maar volg niet opnieuw (cyclus)
+             target_node_id = make_node_id_refactored(f"DEST_{dest_type}", f"{dest_id}_{edge_label.replace(' ','_').replace('/','_')}", context) # Gebruik bestaand ID format
+             # Controleer of de target node al bestaat (zou moeten als het een cyclus is)
+             if target_node_id in added_nodes_set:
+                 edge_key = (source_node_id, target_node_id, edge_label + " (cycle)")
+                 if edge_key not in added_edges_set:
+                      dot_graph.edge(source_node_id, target_node_id, label=edge_label + " (cycle)", style='dashed', color='grey')
+                      added_edges_set.add(edge_key)
+             # Else: iets klopt niet, teken normale pijl maar log evt.
+             return # Stop recursie hier
 
-        # Gebruik de gerefactorde create_or_get_node
+        visited_paths.add(path_key)
+
+        # Teken de node en pijl voor de huidige bestemming
+        target_node_id = make_node_id_refactored(f"DEST_{dest_type}", f"{dest_id}_{edge_label.replace(' ','_').replace('/','_')}", context)
+        target_label, target_shape, target_color, target_node_type = get_node_label_and_style(dest_id, dest_type, current_all_data)
         create_or_get_node_refactored(dot_graph, target_node_id, target_label, added_nodes_set, shape=target_shape, fillcolor=target_color)
-
         edge_key = (source_node_id, target_node_id, edge_label)
         if edge_key not in added_edges_set:
             dot_graph.edge(source_node_id, target_node_id, label=edge_label)
             added_edges_set.add(edge_key)
 
-        if target_node_type in ["Queue", "RingGroup"] and dest_id:
-             q_df = current_all_data.get("queues", pd.DataFrame())
-             rg_df = current_all_data.get("ringgroups", pd.DataFrame())
-             df_lookup = q_df if target_node_type == "Queue" else rg_df
-             row = df_lookup[df_lookup["Virtual Extension Number"] == str(dest_id)]
-             if not row.empty:
-                 noans_dest = row.iloc[0].get("Destination if no answer", np.nan)
-                 noans_type, noans_id = parse_destination(noans_dest)
-                 noans_target_node_id = make_node_id_refactored("END", f"{target_node_id}_NoAns", context)
-                 noans_label, noans_shape, noans_color, _ = get_node_label_and_style(None, "EndCall", current_all_data)
-                 if noans_type:
-                      noans_target_node_id = make_node_id_refactored(f"NOANS_{noans_type}", f"{target_node_id}_{noans_id}", context)
-                      noans_label, noans_shape, noans_color, _ = get_node_label_and_style(noans_id, noans_type, current_all_data)
-                 create_or_get_node_refactored(dot_graph, noans_target_node_id, noans_label, added_nodes_set, shape=noans_shape, fillcolor=noans_color)
-                 noans_edge_key = (target_node_id, noans_target_node_id, "No Answer")
-                 if noans_edge_key not in added_edges_set:
-                     dot_graph.edge(target_node_id, noans_target_node_id, label="No Answer")
-                     added_edges_set.add(noans_edge_key)
+        # --- Recursief volgen --- 
+        # Haal dataframes op
+        queues_df = current_all_data.get("queues", pd.DataFrame())
+        ringgroups_df = current_all_data.get("ringgroups", pd.DataFrame())
+        receptionists_df_all = current_all_data.get("receptionists_all", pd.DataFrame())
+
+        # Als bestemming een Queue is
+        if target_node_type == "Queue" and dest_id and not queues_df.empty:
+            queue_match = queues_df[queues_df["Virtual Extension Number"] == str(dest_id)]
+            if not queue_match.empty:
+                queue_info = queue_match.iloc[0]
+                noans_dest = queue_info.get("Destination if no answer", np.nan)
+                if pd.notna(noans_dest):
+                    # Volg de 'no answer' bestemming
+                    draw_destination_refactored(dot_graph, target_node_id, "No Answer", noans_dest, current_all_data, context, added_nodes_set, added_edges_set, depth + 1, max_depth, visited_paths.copy())
+
+        # Als bestemming een Ring Group is
+        elif target_node_type == "RingGroup" and dest_id and not ringgroups_df.empty:
+            rg_match = ringgroups_df[ringgroups_df["Virtual Extension Number"] == str(dest_id)]
+            if not rg_match.empty:
+                rg_info = rg_match.iloc[0]
+                noans_dest = rg_info.get("Destination if no answer", np.nan)
+                if pd.notna(noans_dest):
+                    # Volg de 'no answer' bestemming
+                    draw_destination_refactored(dot_graph, target_node_id, "No Answer", noans_dest, current_all_data, context, added_nodes_set, added_edges_set, depth + 1, max_depth, visited_paths.copy())
+
+        # Als bestemming een DR is
+        elif target_node_type == "DR" and dest_id and not receptionists_df_all.empty:
+            dr_match = receptionists_df_all[receptionists_df_all["Virtual Extension Number"] == str(dest_id)]
+            if not dr_match.empty:
+                dr_info = dr_match.iloc[0]
+                # Volg alle mogelijke paden vanuit deze DR
+                dest_cols_recursive = ["When office is closed route to", "When on break route to",
+                                       "When on holiday route to", "When on holiday route to ",
+                                       "Send call to", "Invalid input destination"]
+                menu_options_exist = False
+                for i in range(10):
+                     menu_col = f"Menu {i}"
+                     if menu_col in dr_info and pd.notna(dr_info[menu_col]) and str(dr_info[menu_col]).strip():
+                        dest_cols_recursive.append(menu_col)
+                        menu_options_exist = True
+                
+                # Bepaal startpunt voor recursie binnen DR (tijd checks of direct menu/default)
+                # Dit deel is complex, voor nu volgen we alle directe bestemmingen
+                # Een accuratere implementatie zou de tijdchecks *binnen* de recursie moeten evalueren
+                # of de structuur van de draw_destination aanpassen.
+                # Voor nu: volg directe bestemmingen uit de DR info.
+                
+                # Tijd-gebaseerde routes (als startpunten voor recursie vanaf *deze* DR)
+                draw_destination_refactored(dot_graph, target_node_id, "Office Closed", dr_info.get("When office is closed route to", np.nan), current_all_data, f"{context}_r{depth}", added_nodes_set, added_edges_set, depth + 1, max_depth, visited_paths.copy())
+                draw_destination_refactored(dot_graph, target_node_id, "On Break", dr_info.get("When on break route to", np.nan), current_all_data, f"{context}_r{depth}", added_nodes_set, added_edges_set, depth + 1, max_depth, visited_paths.copy())
+                holiday_dest = dr_info.get(next((col for col in ["When on holiday route to", "When on holiday route to "] if col in dr_info.index), "non_existing_col"), np.nan)
+                draw_destination_refactored(dot_graph, target_node_id, "On Holiday", holiday_dest, current_all_data, f"{context}_r{depth}", added_nodes_set, added_edges_set, depth + 1, max_depth, visited_paths.copy())
+
+                # Menu opties / Default / Invalid (als startpunten voor recursie)
+                if menu_options_exist:
+                    for i in range(10):
+                        menu_col = f"Menu {i}"
+                        menu_dest = dr_info.get(menu_col, np.nan)
+                        if pd.notna(menu_dest) and str(menu_dest).strip():
+                            draw_destination_refactored(dot_graph, target_node_id, f"Menu {i}", menu_dest, current_all_data, f"{context}_r{depth}", added_nodes_set, added_edges_set, depth + 1, max_depth, visited_paths.copy())
+                    
+                    default_dest = dr_info.get("Send call to", np.nan)
+                    draw_destination_refactored(dot_graph, target_node_id, "Timeout/Default", default_dest, current_all_data, f"{context}_r{depth}", added_nodes_set, added_edges_set, depth + 1, max_depth, visited_paths.copy())
+                    
+                    invalid_dest = dr_info.get("Invalid input destination", np.nan)
+                    if pd.notna(invalid_dest) and invalid_dest != default_dest:
+                        draw_destination_refactored(dot_graph, target_node_id, "Invalid Input", invalid_dest, current_all_data, f"{context}_r{depth}", added_nodes_set, added_edges_set, depth + 1, max_depth, visited_paths.copy())
+                else: # Geen menu, volg alleen default
+                    default_dest = dr_info.get("Send call to", np.nan)
+                    draw_destination_refactored(dot_graph, target_node_id, "Direct", default_dest, current_all_data, f"{context}_r{depth}", added_nodes_set, added_edges_set, depth + 1, max_depth, visited_paths.copy())
+
+        # Andere typen (User, EndCall, etc.) zijn eindpunten, geen verdere recursie nodig.
 
     # --- Creëer tabs ---
     tab1, tab2, tab3 = st.tabs([
@@ -320,6 +536,18 @@ if all_data:
                 (receptionists_df_all['Onderdeel'].str.strip() == '')
             ].copy()
 
+            # --- BELANGRIJK: Bewaar lijst van *alle* geldige onderdeel namen --- 
+            alle_geldige_onderdelen_namen = []
+            if 'Onderdeel' in receptionists_df_all.columns:
+                # Zorg ervoor dat kolom string is en filter ongeldige waarden
+                geldige_onderdelen_series = receptionists_df_all['Onderdeel'].astype(str).fillna('LEEG')
+                alle_geldige_onderdelen_namen = sorted(geldige_onderdelen_series[
+                     (geldige_onderdelen_series != 'LEEG') & 
+                     (geldige_onderdelen_series != '?') & 
+                     (geldige_onderdelen_series.str.strip() != '')
+                ].unique())
+            # --- Einde aanpassing ---
+            
             # --- 1. Genereer Flows per Geldig Onderdeel ---
             if not drs_met_geldig_onderdeel.empty:
                 grouped_receptionists = drs_met_geldig_onderdeel.groupby('Onderdeel')
@@ -409,11 +637,11 @@ if all_data:
                                 'invalid': dr.get("Invalid input destination", np.nan)
                             }
                             # Gebruik refactored draw_destination met context_id
-                            draw_destination_refactored(dot_onderdeel, office_check_node_id, "Nee", dest_strings['closed'], all_data, context_id, added_nodes_onderdeel, added_edges_onderdeel)
-                            draw_destination_refactored(dot_onderdeel, break_check_node_id, "Ja", dest_strings['break'], all_data, context_id, added_nodes_onderdeel, added_edges_onderdeel)
+                            draw_destination_refactored(dot_onderdeel, office_check_node_id, "Nee", dest_strings['closed'], all_data, context_id, added_nodes_onderdeel, added_edges_onderdeel, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Check", "OFFICECHECK")])) # Start diepte 1, initieel pad bezocht
+                            draw_destination_refactored(dot_onderdeel, break_check_node_id, "Ja", dest_strings['break'], all_data, context_id, added_nodes_onderdeel, added_edges_onderdeel, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Check", "BREAKCHECK")]))
                             holiday_type, _ = parse_destination(dest_strings['holiday'])
                             if holiday_type:
-                                draw_destination_refactored(dot_onderdeel, holiday_check_node_id, "Ja", dest_strings['holiday'], all_data, context_id, added_nodes_onderdeel, added_edges_onderdeel)
+                                draw_destination_refactored(dot_onderdeel, holiday_check_node_id, "Ja", dest_strings['holiday'], all_data, context_id, added_nodes_onderdeel, added_edges_onderdeel, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Check", "HOLIDAYCHECK")]))
                             else:
                                 edge_key = (holiday_check_node_id, in_hours_node_id, "Ja (geen route)")
                                 if edge_key not in added_edges_onderdeel:
@@ -425,17 +653,17 @@ if all_data:
                             if has_menu:
                                 create_or_get_node_refactored(dot_onderdeel, in_hours_node_id, "🎶 Menu speelt...", added_nodes_onderdeel) # Update label if it exists
                                 for key, dest_str in menu_options_strings.items():
-                                    draw_destination_refactored(dot_onderdeel, in_hours_node_id, f"Kies {key}", dest_str, all_data, context_id, added_nodes_onderdeel, added_edges_onderdeel)
+                                    draw_destination_refactored(dot_onderdeel, in_hours_node_id, f"Kies {key}", dest_str, all_data, context_id, added_nodes_onderdeel, added_edges_onderdeel, depth=1, max_depth=10, visited_paths=set([(dr_node_id, f"Menu {key}", f"Menu {key}")]))
 
                                 timeout_edge_label = f"Timeout{ivr_timeout_edge_label_part} /\\nGeen invoer"
-                                draw_destination_refactored(dot_onderdeel, in_hours_node_id, timeout_edge_label, dest_strings['default'], all_data, context_id, added_nodes_onderdeel, added_edges_onderdeel)
+                                draw_destination_refactored(dot_onderdeel, in_hours_node_id, timeout_edge_label, dest_strings['default'], all_data, context_id, added_nodes_onderdeel, added_edges_onderdeel, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Timeout/Default", f"Timeout{ivr_timeout_edge_label_part}")]))
 
                                 if pd.notna(dest_strings['invalid']) and dest_strings['invalid'] != dest_strings['default']:
-                                     draw_destination_refactored(dot_onderdeel, in_hours_node_id, "Invalid", dest_strings['invalid'], all_data, context_id, added_nodes_onderdeel, added_edges_onderdeel)
+                                     draw_destination_refactored(dot_onderdeel, in_hours_node_id, "Invalid", dest_strings['invalid'], all_data, context_id, added_nodes_onderdeel, added_edges_onderdeel, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Invalid Input", f"Invalid {dest_strings['invalid']}")]))
 
                             else: # Geen menu
                                 create_or_get_node_refactored(dot_onderdeel, in_hours_node_id, "Geen menu", added_nodes_onderdeel)
-                                draw_destination_refactored(dot_onderdeel, in_hours_node_id, "Direct", dest_strings['default'], all_data, context_id, added_nodes_onderdeel, added_edges_onderdeel)
+                                draw_destination_refactored(dot_onderdeel, in_hours_node_id, "Direct", dest_strings['default'], all_data, context_id, added_nodes_onderdeel, added_edges_onderdeel, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Direct", f"Direct {dest_strings['default']}")]))
 
                         # Toon grafiek voor dit onderdeel
                         try:
@@ -518,11 +746,11 @@ if all_data:
                             'default': dr.get("Send call to", np.nan),
                             'invalid': dr.get("Invalid input destination", np.nan)
                         }
-                        draw_destination_refactored(dot_individual, office_check_node_id, "Nee", dest_strings['closed'], all_data, context_id, added_nodes_indiv, added_edges_indiv)
-                        draw_destination_refactored(dot_individual, break_check_node_id, "Ja", dest_strings['break'], all_data, context_id, added_nodes_indiv, added_edges_indiv)
+                        draw_destination_refactored(dot_individual, office_check_node_id, "Nee", dest_strings['closed'], all_data, context_id, added_nodes_indiv, added_edges_indiv, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Check", "OFFICECHECK")]))
+                        draw_destination_refactored(dot_individual, break_check_node_id, "Ja", dest_strings['break'], all_data, context_id, added_nodes_indiv, added_edges_indiv, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Check", "BREAKCHECK")]))
                         holiday_type, _ = parse_destination(dest_strings['holiday'])
                         if holiday_type:
-                            draw_destination_refactored(dot_individual, holiday_check_node_id, "Ja", dest_strings['holiday'], all_data, context_id, added_nodes_indiv, added_edges_indiv)
+                            draw_destination_refactored(dot_individual, holiday_check_node_id, "Ja", dest_strings['holiday'], all_data, context_id, added_nodes_indiv, added_edges_indiv, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Check", "HOLIDAYCHECK")]))
                         else:
                             edge_key = (holiday_check_node_id, in_hours_node_id, "Ja (geen route)")
                             if edge_key not in added_edges_indiv:
@@ -534,17 +762,17 @@ if all_data:
                         if has_menu:
                             create_or_get_node_refactored(dot_individual, in_hours_node_id, "🎶 Menu speelt...", added_nodes_indiv)
                             for key, dest_str in menu_options_strings.items():
-                                draw_destination_refactored(dot_individual, in_hours_node_id, f"Kies {key}", dest_str, all_data, context_id, added_nodes_indiv, added_edges_indiv)
+                                draw_destination_refactored(dot_individual, in_hours_node_id, f"Kies {key}", dest_str, all_data, context_id, added_nodes_indiv, added_edges_indiv, depth=1, max_depth=10, visited_paths=set([(dr_node_id, f"Menu {key}", f"Menu {key}")]))
 
                             timeout_edge_label = f"Timeout{ivr_timeout_edge_label_part} /\\nGeen invoer"
-                            draw_destination_refactored(dot_individual, in_hours_node_id, timeout_edge_label, dest_strings['default'], all_data, context_id, added_nodes_indiv, added_edges_indiv)
+                            draw_destination_refactored(dot_individual, in_hours_node_id, timeout_edge_label, dest_strings['default'], all_data, context_id, added_nodes_indiv, added_edges_indiv, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Timeout/Default", f"Timeout{ivr_timeout_edge_label_part}")]))
 
                             if pd.notna(dest_strings['invalid']) and dest_strings['invalid'] != dest_strings['default']:
-                                 draw_destination_refactored(dot_individual, in_hours_node_id, "Invalid", dest_strings['invalid'], all_data, context_id, added_nodes_indiv, added_edges_indiv)
+                                 draw_destination_refactored(dot_individual, in_hours_node_id, "Invalid", dest_strings['invalid'], all_data, context_id, added_nodes_indiv, added_edges_indiv, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Invalid Input", f"Invalid {dest_strings['invalid']}")]))
 
                         else: # Geen menu
                             create_or_get_node_refactored(dot_individual, in_hours_node_id, "Geen menu", added_nodes_indiv)
-                            draw_destination_refactored(dot_individual, in_hours_node_id, "Direct", dest_strings['default'], all_data, context_id, added_nodes_indiv, added_edges_indiv)
+                            draw_destination_refactored(dot_individual, in_hours_node_id, "Direct", dest_strings['default'], all_data, context_id, added_nodes_indiv, added_edges_indiv, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Direct", f"Direct {dest_strings['default']}")]))
 
                         # Toon grafiek voor deze individuele DR
                         try:
@@ -552,56 +780,68 @@ if all_data:
                         except Exception as e:
                             st.error(f"Fout genereren grafiek voor IVR '{dr_name}' ({dr_ext_str}): {e}")
                             st.code(dot_individual.source, language='dot')
-            elif drs_met_geldig_onderdeel.empty:
+            elif drs_met_geldig_onderdeel.empty: # Alleen tonen als er *ook* geen geldige zijn
                  st.info("Geen Digital Receptionists zonder geldig Onderdeel gevonden om individueel weer te geven.")
 
     # --- Tab 2: Users per Onderdeel ---
     with tab2:
         st.header("Overzicht: Gebruikers bereikbaar per Onderdeel")
-
-        # Controleer of benodigde dataframes bestaan
         if users_df.empty or receptionists_df_all.empty:
             st.warning("Bestanden 'Users.csv' of 'Receptionists.csv' ontbreken of zijn leeg.")
-        elif 'Onderdeel' not in receptionists_df_all.columns or 'Number' not in users_df.columns or 'Department' not in users_df.columns:
-             st.error("Benodigde kolommen ('Onderdeel', 'Number', 'Department', 'Naam') ontbreken in de CSV-bestanden.")
+        # Check of de *originele* Onderdeel kolom bestaat (of de hernoemde eerste kolom)
+        elif 'Onderdeel' not in receptionists_df_all.columns: 
+             st.error("Kolom 'Onderdeel' (of eerste kolom) niet gevonden in Receptionists.csv.")
+        elif not ('Number' in users_df.columns and 'Department' in users_df.columns and 'Naam' in users_df.columns):
+            st.error("Benodigde kolommen ('Number', 'Department', 'Naam') ontbreken in Users.csv.")
         else:
-            # Helper functie om users te vinden (met cycle detection)
-            @st.cache_data # Cache resultaten van deze complexe zoekactie
-            def find_reachable_users(start_destination_string, _all_data, max_depth=10):
+            @st.cache_data
+            def find_reachable_users(_start_destination_strings, _all_data, max_depth=10):
                 users_found = set()
-                queue = [(start_destination_string, 0)] # (destination, depth)
-                visited_nodes = set() # Houd bij welke nodes (type, id) we bezoeken om cycli te voorkomen
+                queue = [(dest_str, 0) for dest_str in _start_destination_strings]
+                visited_nodes = set()
+                nummerblok_ranges = _all_data.get("nummerblok_ranges", [])
+
+                def get_nummerblok_strings_for_user(user_info, ranges):
+                    did_string = str(user_info.get('DID', ''))
+                    outbound_cid = str(user_info.get('OutboundCallerID', ''))
+                    did_blokken = set()
+                    if did_string:
+                        for did_part in did_string.split(':'):
+                            blok = find_nummerblok_for_number(did_part.strip(), ranges)
+                            if blok: did_blokken.add(blok)
+                    outbound_blok = find_nummerblok_for_number(outbound_cid, ranges)
+                    did_blokken_str = ", ".join(sorted(list(did_blokken))) if did_blokken else ""
+                    outbound_blok_str = outbound_blok if outbound_blok else ""
+                    return did_blokken_str, outbound_blok_str
 
                 while queue:
                     current_dest_str, depth = queue.pop(0)
-                    if depth > max_depth: continue # Voorkom oneindige lussen bij diepe recursie/cycli
-
+                    if depth > max_depth: continue
                     dest_type, dest_id = parse_destination(current_dest_str)
                     node_key = (dest_type, dest_id)
-
-                    if not dest_type or node_key in visited_nodes:
-                        continue
+                    if not dest_type or node_key in visited_nodes: continue
                     visited_nodes.add(node_key)
 
-                    # Zoek user info op nummer
+                    # User?
                     if dest_type == "User" or dest_type == "ExtensionNumber" or dest_type == "UnknownType":
-                        # Gebruik str(dest_id) voor consistente lookup
                         user_match = _all_data["users"][_all_data["users"]["Number"] == str(dest_id)]
                         if not user_match.empty:
                             user_info = user_match.iloc[0]
-                            # --- Department Handling --- 
                             department = user_info.get('Department', 'Geen Afdeling')
-                            if pd.isna(department) or str(department).strip() == "":
-                                department = "Geen Afdeling"
-                            # --- End Department Handling ---
+                            if pd.isna(department) or str(department).strip() == "": department = "Geen Afdeling"
+                            did_blokken_str, outbound_blok_str = get_nummerblok_strings_for_user(user_info, nummerblok_ranges)
                             users_found.add((
                                 user_info.get('Number', dest_id),
                                 user_info.get('Naam', f'User {dest_id}'),
-                                str(department) # Zorg dat het een string is
+                                str(department),
+                                str(user_info.get('DID', '')),
+                                str(user_info.get('OutboundCallerID', '')),
+                                str(user_info.get('MobileNumber', '')),
+                                did_blokken_str,
+                                outbound_blok_str
                             ))
                             continue
-
-                    # Check leden van Queues en Ring Groups en hun 'no answer' bestemming
+                    # Queue?
                     if dest_type == "Queue" or (dest_type == "ExtensionNumber" and not _all_data["queues"][_all_data["queues"]["Virtual Extension Number"] == str(dest_id)].empty):
                          q_df = _all_data.get("queues", pd.DataFrame())
                          queue_match = q_df[q_df["Virtual Extension Number"] == str(dest_id)]
@@ -610,23 +850,25 @@ if all_data:
                              for col in queue_info.index:
                                  if col.startswith("User ") and pd.notna(queue_info[col]):
                                      user_name_in_queue = str(queue_info[col])
-                                     # Zoek user op naam voor Department info
                                      user_match_by_name = _all_data["users"][_all_data["users"]["Naam"] == user_name_in_queue]
                                      if not user_match_by_name.empty:
                                           user_info = user_match_by_name.iloc[0]
-                                          # --- Department Handling --- 
                                           department = user_info.get('Department', 'Geen Afdeling')
-                                          if pd.isna(department) or str(department).strip() == "":
-                                              department = "Geen Afdeling"
-                                          # --- End Department Handling ---
+                                          if pd.isna(department) or str(department).strip() == "": department = "Geen Afdeling"
+                                          did_blokken_str, outbound_blok_str = get_nummerblok_strings_for_user(user_info, nummerblok_ranges)
                                           users_found.add((
                                                 user_info.get('Number', 'N/A'),
                                                 user_info.get('Naam', user_name_in_queue),
-                                                str(department) # Zorg dat het een string is
+                                                str(department),
+                                                str(user_info.get('DID', '')),
+                                                str(user_info.get('OutboundCallerID', '')),
+                                                str(user_info.get('MobileNumber', '')),
+                                                did_blokken_str,
+                                                outbound_blok_str
                                           ))
-                             noans_dest = queue_info.get("Destination if no answer", np.nan)
-                             if pd.notna(noans_dest): queue.append((noans_dest, depth + 1))
-
+                         noans_dest = queue_info.get("Destination if no answer", np.nan)
+                         if pd.notna(noans_dest): queue.append((noans_dest, depth + 1))
+                    # RingGroup?
                     elif dest_type == "RingGroup" or (dest_type == "ExtensionNumber" and not _all_data["ringgroups"][_all_data["ringgroups"]["Virtual Extension Number"] == str(dest_id)].empty):
                         rg_df = _all_data.get("ringgroups", pd.DataFrame())
                         rg_match = rg_df[rg_df["Virtual Extension Number"] == str(dest_id)]
@@ -635,109 +877,174 @@ if all_data:
                              for col in rg_info.index:
                                  if col.startswith("User ") and pd.notna(rg_info[col]):
                                       user_name_in_rg = str(rg_info[col])
-                                      # Zoek user op naam voor Department info
                                       user_match_by_name = _all_data["users"][_all_data["users"]["Naam"] == user_name_in_rg]
                                       if not user_match_by_name.empty:
                                            user_info = user_match_by_name.iloc[0]
-                                           # --- Department Handling --- 
                                            department = user_info.get('Department', 'Geen Afdeling')
-                                           if pd.isna(department) or str(department).strip() == "":
-                                               department = "Geen Afdeling"
-                                           # --- End Department Handling ---
+                                           if pd.isna(department) or str(department).strip() == "": department = "Geen Afdeling"
+                                           did_blokken_str, outbound_blok_str = get_nummerblok_strings_for_user(user_info, nummerblok_ranges)
                                            users_found.add((
                                                  user_info.get('Number', 'N/A'),
                                                  user_info.get('Naam', user_name_in_rg),
-                                                 str(department) # Zorg dat het een string is
+                                                 str(department),
+                                                 str(user_info.get('DID', '')),
+                                                 str(user_info.get('OutboundCallerID', '')),
+                                                 str(user_info.get('MobileNumber', '')),
+                                                 did_blokken_str,
+                                                 outbound_blok_str
                                            ))
-                             noans_dest = rg_info.get("Destination if no answer", np.nan)
-                             if pd.notna(noans_dest): queue.append((noans_dest, depth + 1))
-
-                    # Volg DR routes
-                    elif dest_type == "DR" or (dest_type == "ExtensionNumber" and not _all_data["receptionists_all"][_all_data["receptionists_all"]["Virtual Extension Number"] == dest_id].empty):
+                        noans_dest = rg_info.get("Destination if no answer", np.nan)
+                        if pd.notna(noans_dest): queue.append((noans_dest, depth + 1))
+                    # DR?
+                    elif dest_type == "DR" or (dest_type == "ExtensionNumber" and not _all_data["receptionists_all"][_all_data["receptionists_all"]["Virtual Extension Number"] == str(dest_id)].empty):
                          rec_df = _all_data.get("receptionists_all", pd.DataFrame())
-                         dr_match = rec_df[rec_df["Virtual Extension Number"] == dest_id]
+                         dr_match = rec_df[rec_df["Virtual Extension Number"] == str(dest_id)]
                          if not dr_match.empty:
                               dr_info = dr_match.iloc[0]
-                              # Voeg alle mogelijke bestemmingen toe aan de queue
-                              dest_cols = ["When office is closed route to", "When on break route to",
-                                           "When on holiday route to", "When on holiday route to ", # Spatie variant
-                                           "Send call to", "Invalid input destination"]
-                              for i in range(10): dest_cols.append(f"Menu {i}")
-
-                              for col in dest_cols:
-                                   if col in dr_info.index and pd.notna(dr_info[col]):
-                                        queue.append((dr_info[col], depth + 1))
+                              dest_cols_recursive = ["When office is closed route to", "When on break route to",
+                                                   "When on holiday route to", "When on holiday route to ",
+                                                   "Send call to", "Invalid input destination"]
+                              for i in range(10): 
+                                  menu_col = f"Menu {i}"
+                                  if menu_col in dr_info and pd.notna(dr_info[menu_col]) and str(dr_info[menu_col]).strip():
+                                     dest_cols_recursive.append(menu_col)
+                              for col in dest_cols_recursive:
+                                   dest_val = dr_info.get(col, np.nan)
+                                   if pd.notna(dest_val):
+                                        queue.append((dest_val, depth + 1))
 
                 return users_found
-
-            # Verzamel data per onderdeel
+            
+            # Verzamel data initieel
             users_per_onderdeel_data = []
-            receptionists_met_onderdeel = receptionists_df_all.dropna(subset=['Onderdeel'])
-            alle_onderdelen = receptionists_met_onderdeel['Onderdeel'].unique()
-
+            # Gebruik hier *ook* drs_met_geldig_onderdeel om te voorkomen dat we ongeldige onderdelen meenemen
+            receptionists_met_onderdeel = receptionists_df_all[
+                 (receptionists_df_all['Onderdeel'].astype(str).fillna('LEEG') != 'LEEG') &
+                 (receptionists_df_all['Onderdeel'].astype(str).fillna('') != '?') &
+                 (receptionists_df_all['Onderdeel'].astype(str).str.strip() != '')
+            ].copy()
+            onderdelen_met_drs = sorted(receptionists_met_onderdeel['Onderdeel'].unique()) # Onderdelen die daadwerkelijk DRs hebben
+            
             progress_bar = st.progress(0)
-            total_onderdelen = len(alle_onderdelen)
+            total_onderdelen_met_drs = len(onderdelen_met_drs)
 
-            for i, onderdeel in enumerate(alle_onderdelen):
-                drs_in_onderdeel = receptionists_met_onderdeel[receptionists_met_onderdeel['Onderdeel'] == onderdeel]
-                reachable_users_in_onderdeel = set()
-
-                for _, dr in drs_in_onderdeel.iterrows():
-                    # Start zoektocht vanaf deze DR (directe bestemmingen)
+            # Loop over onderdelen die DRs hebben
+            for i, onderdeel in enumerate(onderdelen_met_drs):
+                drs_in_huidig_onderdeel = receptionists_met_onderdeel[receptionists_met_onderdeel['Onderdeel'] == onderdeel]
+                start_destinations_for_onderdeel = []
+                for _, dr in drs_in_huidig_onderdeel.iterrows():
                     dest_cols = ["When office is closed route to", "When on break route to",
-                                 "When on holiday route to", "When on holiday route to ",
-                                 "Send call to", "Invalid input destination"]
-                    for i in range(10): dest_cols.append(f"Menu {i}")
-
+                                "When on holiday route to", "When on holiday route to ",
+                                "Send call to", "Invalid input destination"]
+                    for menu_idx in range(10): dest_cols.append(f"Menu {menu_idx}")
                     for col in dest_cols:
-                         if col in dr.index and pd.notna(dr[col]):
-                              found_users = find_reachable_users(dr[col], all_data)
-                              reachable_users_in_onderdeel.update(found_users)
-
-                # Voeg resultaten toe aan de lijst
-                for user_num, user_name, user_dep in reachable_users_in_onderdeel:
+                        dest_val = dr.get(col, np.nan)
+                        if pd.notna(dest_val) and str(dest_val).strip():
+                            start_destinations_for_onderdeel.append(str(dest_val))
+                
+                reachable_users_tuples = find_reachable_users(start_destinations_for_onderdeel, all_data)
+                
+                for user_num, user_name, user_dep, did_str, cid, mobile, did_blokken_str, outbound_blok_str in reachable_users_tuples:
                      users_per_onderdeel_data.append({
                          "Onderdeel": onderdeel,
                          "User Number": user_num,
                          "User Name": user_name,
-                         "Department": user_dep
+                         "Department": user_dep,
+                         "DID": did_str,
+                         "Outbound CID": cid,
+                         "Mobile": mobile,
+                         "Nummerblok(ken) DID": did_blokken_str,
+                         "Nummerblok OutboundCID": outbound_blok_str
                      })
-                progress_bar.progress((i + 1) / total_onderdelen)
-
-            if not users_per_onderdeel_data:
-                st.info("Geen bereikbare gebruikers gevonden via de Digital Receptionists.")
+                progress_bar.progress((i + 1) / total_onderdelen_met_drs)
+            
+            # --- DEBUG START ---
+            st.subheader("Debug Info: Ruwe Resultaten (Tab 2)")
+            st.write(f"Aantal gevonden gebruiker-tuples (voor alle onderdelen): {len(users_per_onderdeel_data)}")
+            if users_per_onderdeel_data:
+                st.write("Voorbeeld eerste tuple:", users_per_onderdeel_data[0])
+            # --- DEBUG END ---
+            
+            # Bouw initiële DataFrame
+            if users_per_onderdeel_data:
+                 users_per_onderdeel_df = pd.DataFrame(users_per_onderdeel_data)
+                 # --- DEBUG START ---
+                 st.write("DataFrame gemaakt vanuit tuples. Shape:", users_per_onderdeel_df.shape)
+                 st.write("Head van initiële DataFrame:")
+                 st.dataframe(users_per_onderdeel_df.head())
+                 st.write("Nummerblok kolommen (head):")
+                 st.dataframe(users_per_onderdeel_df[['Nummerblok(ken) DID', 'Nummerblok OutboundCID']].head())
+                 # --- DEBUG END ---
             else:
-                users_per_onderdeel_df = pd.DataFrame(users_per_onderdeel_data)
-                # Zorg ervoor dat de kolom Department altijd string is na creatie DataFrame
-                users_per_onderdeel_df['Department'] = users_per_onderdeel_df['Department'].astype(str)
-                users_per_onderdeel_df = users_per_onderdeel_df.drop_duplicates().sort_values(by=["Onderdeel", "User Name"])
+                 users_per_onderdeel_df = pd.DataFrame(columns=["Onderdeel", "User Number", "User Name", "Department", "DID", "Outbound CID", "Mobile", "Nummerblok(ken) DID", "Nummerblok OutboundCID"])
+                 # --- DEBUG START ---
+                 st.write("Geen gebruikersdata gevonden, lege DataFrame gemaakt.")
+                 # --- DEBUG END ---
+                 
+            # --- Voeg ontbrekende onderdelen toe --- 
+            # Gebruik de lijst van *alle* geldige onderdelen die eerder is bepaald
+            onderdelen_in_df = set(users_per_onderdeel_df['Onderdeel'].unique())
+            missing_onderdelen = set(alle_geldige_onderdelen_namen) - onderdelen_in_df
+            
+            if missing_onderdelen:
+                 placeholder_data = []
+                 for missing_ond in missing_onderdelen:
+                      placeholder_data.append({
+                          "Onderdeel": missing_ond,
+                          "User Number": "", "User Name": "(Geen bereikbare users)", "Department": "", 
+                          "DID": "", "Outbound CID": "", "Mobile": "", 
+                          "Nummerblok(ken) DID": "", "Nummerblok OutboundCID": ""
+                      })
+                 missing_df = pd.DataFrame(placeholder_data)
+                 users_per_onderdeel_df = pd.concat([users_per_onderdeel_df, missing_df], ignore_index=True)
+            # --- Einde toevoegen --- 
 
-                # Filter opties
-                st.subheader("Filter Opties")
-                # Nu zouden alle department values strings moeten zijn
-                departments = sorted(users_per_onderdeel_df['Department'].unique())
-                selected_departments = st.multiselect("Selecteer Afdeling(en):", departments, default=departments)
+            # Zorg dat kolommen string zijn en sorteer
+            users_per_onderdeel_df['Department'] = users_per_onderdeel_df['Department'].astype(str)
+            users_per_onderdeel_df['Nummerblok(ken) DID'] = users_per_onderdeel_df['Nummerblok(ken) DID'].astype(str)
+            users_per_onderdeel_df['Nummerblok OutboundCID'] = users_per_onderdeel_df['Nummerblok OutboundCID'].astype(str)
+            # Sorteer de *complete* dataframe
+            users_per_onderdeel_df = users_per_onderdeel_df.sort_values(by=["Onderdeel", "User Name"])
 
-                if not selected_departments:
-                    st.warning("Selecteer minimaal één afdeling.")
-                else:
-                    filtered_df = users_per_onderdeel_df[users_per_onderdeel_df['Department'].isin(selected_departments)]
-                    st.dataframe(filtered_df, use_container_width=True)
+            # Filter opties (logica blijft hetzelfde)
+            st.subheader("Filter Opties")
+            # Filter op Onderdeel
+            onderdelen_list = sorted(users_per_onderdeel_df['Onderdeel'].unique())
+            selected_onderdelen_tab2 = st.multiselect("Selecteer Onderdeel/delen:", onderdelen_list, default=onderdelen_list)
+            
+            # Filter op Department
+            # Maak filterlijst *na* toevoegen lege rijen en sorteren
+            departments = sorted(users_per_onderdeel_df['Department'].unique())
+            selected_departments = st.multiselect("Selecteer Afdeling(en):", departments, default=departments)
 
+            # Combineer filter resultaten
+            filtered_df = users_per_onderdeel_df.copy()
+            if not selected_onderdelen_tab2: # Als selectie leeg is, toon niets (of alles? Kies hier) 
+                st.warning("Selecteer minimaal één onderdeel.")
+                filtered_df = filtered_df.iloc[0:0] # Lege dataframe
+            else:
+                filtered_df = filtered_df[filtered_df['Onderdeel'].isin(selected_onderdelen_tab2)]
+                
+            if not selected_departments:
+                st.warning("Selecteer minimaal één afdeling.")
+                # Reset naar leeg als geen afdeling is geselecteerd *nadat* onderdeel gefilterd is
+                filtered_df = filtered_df.iloc[0:0] 
+            else:
+                 # Pas department filter toe op de al gefilterde dataframe
+                filtered_df = filtered_df[filtered_df['Department'].isin(selected_departments)]
+                
+            # Toon de gefilterde dataframe
+            st.dataframe(filtered_df, use_container_width=True, 
+                             column_order=["User Name", "User Number", "User Department", "Nummerblok(ken) DID", "Nummerblok OutboundCID", "Reached Via Type", "Reached Via Name", "Reached Via Ext", "Onderdeel"])
 
-    # --- Tab 3: DRs per User ---
+    # --- Tab 3: DRs per User (OPNIEUW TOEGEVOEGD) ---
     with tab3:
         st.header("Overzicht: Welke DRs/Queues/RGs leiden naar welke User?")
-
-        # Controleer of benodigde dataframes bestaan
-        if users_df.empty or receptionists_df_all.empty:
+        
+        if users_df.empty or receptionists_df_all.empty: 
             st.warning("Bestanden 'Users.csv' of 'Receptionists.csv' ontbreken of zijn leeg.")
-        elif not (
-            'Onderdeel' in receptionists_df_all.columns and
-            'Number' in users_df.columns and
-            'Department' in users_df.columns and
-            'Naam' in users_df.columns
-        ):
+        elif not ('Onderdeel' in receptionists_df_all.columns and 'Number' in users_df.columns and 
+                 'Department' in users_df.columns and 'Naam' in users_df.columns):
             st.error("Benodigde kolommen ('Onderdeel', 'Number', 'Department', 'Naam') ontbreken in de CSV-bestanden.")
         else:
             @st.cache_data
@@ -747,26 +1054,37 @@ if all_data:
                 receptionists_data = _all_data.get("receptionists_all", pd.DataFrame())
                 queues_data = _all_data.get("queues", pd.DataFrame())
                 ringgroups_data = _all_data.get("ringgroups", pd.DataFrame())
+                nummerblok_ranges = _all_data.get("nummerblok_ranges", [])
 
-                # Helper om user info snel op te zoeken (nummer -> details)
+                # Helper functie binnen build_user_reachability_data, correct ge-indent
+                def get_nummerblok_strings_for_user(user_info, ranges):
+                    did_string = str(user_info.get('DID', ''))
+                    outbound_cid = str(user_info.get('OutboundCallerID', ''))
+                    did_blokken = set()
+                    if did_string:
+                        for did_part in did_string.split(':'):
+                            blok = find_nummerblok_for_number(did_part.strip(), ranges)
+                            if blok: did_blokken.add(blok)
+                    outbound_blok = find_nummerblok_for_number(outbound_cid, ranges)
+                    did_blokken_str = ", ".join(sorted(list(did_blokken))) if did_blokken else ""
+                    outbound_blok_str = outbound_blok if outbound_blok else ""
+                    return did_blokken_str, outbound_blok_str
+                # Einde helper
+
                 user_dict_by_num = {str(row['Number']): row for _, row in users_data.iterrows()} if 'Number' in users_data.columns else {}
-                # Helper om user info snel op te zoeken (naam -> details)
                 user_dict_by_name = {str(row['Naam']): row for _, row in users_data.iterrows()} if 'Naam' in users_data.columns else {}
 
                 progress_bar = st.progress(0, text="Analyseren van DR-bestemmingen...")
                 total_drs = len(receptionists_data)
-
+                
                 for i, (_, dr) in enumerate(receptionists_data.iterrows()):
                     onderdeel_naam = dr.get('Onderdeel', 'Onbekend Onderdeel')
                     dr_name = dr.get("Digital Receptionist Name", "Naamloos")
                     dr_ext = str(dr.get("Virtual Extension Number", "N/A"))
-
-                    # Verzamel alle bestemmingen van deze DR
                     dest_cols = ["When office is closed route to", "When on break route to",
-                                 "When on holiday route to", "When on holiday route to ",
-                                 "Send call to", "Invalid input destination"]
+                                    "When on holiday route to", "When on holiday route to ",
+                                    "Send call to", "Invalid input destination"]
                     for menu_idx in range(10): dest_cols.append(f"Menu {menu_idx}")
-
                     for col in dest_cols:
                         dest_string = dr.get(col, np.nan)
                         if pd.notna(dest_string):
@@ -775,23 +1093,23 @@ if all_data:
                             # Direct naar User?
                             potential_user_ext = None
                             if dest_type == "User" or dest_type == "ExtensionNumber" or dest_type == "UnknownType":
-                                potential_user_ext = str(dest_id) # Gebruik string
+                                potential_user_ext = str(dest_id)
                             
                             if potential_user_ext and potential_user_ext in user_dict_by_num:
                                 user_info = user_dict_by_num[potential_user_ext]
-                                # --- Department Handling --- 
                                 department = user_info.get('Department', 'Geen Afdeling')
-                                if pd.isna(department) or str(department).strip() == "":
-                                    department = "Geen Afdeling"
-                                # --- End Department Handling ---
+                                if pd.isna(department) or str(department).strip() == "": department = "Geen Afdeling"
+                                did_blokken_str, outbound_blok_str = get_nummerblok_strings_for_user(user_info, nummerblok_ranges)
                                 results.append({
                                     "User Number": potential_user_ext,
                                     "User Name": user_info.get('Naam', f'User {potential_user_ext}'),
-                                    "User Department": str(department), # Zorg voor string
+                                    "User Department": str(department),
                                     "Reached Via Type": "DR",
                                     "Reached Via Name": dr_name,
                                     "Reached Via Ext": dr_ext,
-                                    "Onderdeel": onderdeel_naam
+                                    "Onderdeel": onderdeel_naam,
+                                    "Nummerblok(ken) DID": did_blokken_str, 
+                                    "Nummerblok OutboundCID": outbound_blok_str 
                                 })
 
                             # Naar Queue?
@@ -806,19 +1124,19 @@ if all_data:
                                             user_name_in_queue = str(queue_info[q_col])
                                             if user_name_in_queue in user_dict_by_name:
                                                 user_info = user_dict_by_name[user_name_in_queue]
-                                                # --- Department Handling --- 
                                                 department = user_info.get('Department', 'Geen Afdeling')
-                                                if pd.isna(department) or str(department).strip() == "":
-                                                    department = "Geen Afdeling"
-                                                # --- End Department Handling ---
+                                                if pd.isna(department) or str(department).strip() == "": department = "Geen Afdeling"
+                                                did_blokken_str, outbound_blok_str = get_nummerblok_strings_for_user(user_info, nummerblok_ranges)
                                                 results.append({
                                                     "User Number": user_info.get('Number', 'N/A'),
                                                     "User Name": user_name_in_queue,
-                                                    "User Department": str(department), # Zorg voor string
+                                                    "User Department": str(department),
                                                     "Reached Via Type": "Queue",
                                                     "Reached Via Name": queue_name,
                                                     "Reached Via Ext": queue_ext,
-                                                    "Onderdeel": onderdeel_naam
+                                                    "Onderdeel": onderdeel_naam,
+                                                    "Nummerblok(ken) DID": did_blokken_str, 
+                                                    "Nummerblok OutboundCID": outbound_blok_str 
                                                 })
 
                             # Naar Ring Group?
@@ -833,32 +1151,32 @@ if all_data:
                                              user_name_in_rg = str(rg_info[rg_col])
                                              if user_name_in_rg in user_dict_by_name:
                                                  user_info = user_dict_by_name[user_name_in_rg]
-                                                 # --- Department Handling --- 
                                                  department = user_info.get('Department', 'Geen Afdeling')
-                                                 if pd.isna(department) or str(department).strip() == "":
-                                                     department = "Geen Afdeling"
-                                                 # --- End Department Handling ---
+                                                 if pd.isna(department) or str(department).strip() == "": department = "Geen Afdeling"
+                                                 did_blokken_str, outbound_blok_str = get_nummerblok_strings_for_user(user_info, nummerblok_ranges)
                                                  results.append({
                                                      "User Number": user_info.get('Number', 'N/A'),
                                                      "User Name": user_name_in_rg,
-                                                     "User Department": str(department), # Zorg voor string
+                                                     "User Department": str(department),
                                                      "Reached Via Type": "RingGroup",
                                                      "Reached Via Name": rg_name,
                                                      "Reached Via Ext": rg_ext,
-                                                     "Onderdeel": onderdeel_naam
+                                                     "Onderdeel": onderdeel_naam,
+                                                     "Nummerblok(ken) DID": did_blokken_str, 
+                                                     "Nummerblok OutboundCID": outbound_blok_str
                                                  })
                     progress_bar.progress((i + 1) / total_drs, text=f"Analyseren DR {i+1}/{total_drs}...")
-
-                progress_bar.empty() # Verwijder progress bar
+                
+                progress_bar.empty()
                 if not results:
                     return pd.DataFrame()
-
                 df = pd.DataFrame(results)
-                # Zorg dat User Department altijd string is
                 df['User Department'] = df['User Department'].astype(str)
+                df['Nummerblok(ken) DID'] = df['Nummerblok(ken) DID'].astype(str)
+                df['Nummerblok OutboundCID'] = df['Nummerblok OutboundCID'].astype(str)
                 df = df.drop_duplicates().sort_values(by=["User Name", "Onderdeel", "Reached Via Type", "Reached Via Name"])
                 return df
-
+            
             # Bouw de data en toon de tabel
             drs_per_user_df = build_user_reachability_data(all_data)
 
@@ -866,30 +1184,34 @@ if all_data:
                 st.info("Geen gebruikers gevonden die bereikt worden via Digital Receptionists, Queues of Ring Groups.")
             else:
                 st.subheader("Filter Opties")
-                # Filter op User Name
                 unique_users = sorted(drs_per_user_df['User Name'].astype(str).unique())
                 selected_users = st.multiselect("Filter op Gebruiker:", unique_users, default=[])
-
-                # Filter op Department (nu gegarandeerd strings)
                 unique_departments = sorted(drs_per_user_df['User Department'].unique())
                 selected_departments = st.multiselect("Filter op Afdeling:", unique_departments, default=[])
-
-                # Filter op Onderdeel
                 unique_onderdelen = sorted(drs_per_user_df['Onderdeel'].astype(str).unique())
                 selected_onderdelen = st.multiselect("Filter op Onderdeel:", unique_onderdelen, default=[])
-
-                # Filter op Reached Via Type
                 unique_types = sorted(drs_per_user_df['Reached Via Type'].astype(str).unique())
                 selected_types = st.multiselect("Filter op Bereikt Via Type:", unique_types, default=[])
+                
+                # --- Filters voor Nummerblokken --- 
+                unique_did_blokken = sorted(drs_per_user_df[drs_per_user_df['Nummerblok(ken) DID'] != '']['Nummerblok(ken) DID'].unique())
+                selected_did_blokken = st.multiselect("Filter op Nummerblok DID:", unique_did_blokken, default=[])
+                
+                unique_outbound_blokken = sorted(drs_per_user_df[drs_per_user_df['Nummerblok OutboundCID'] != '']['Nummerblok OutboundCID'].unique())
+                selected_outbound_blokken = st.multiselect("Filter op Nummerblok Outbound CID:", unique_outbound_blokken, default=[])
+                # --- Einde Filters --- 
 
-                # Pas filters toe
+                # Pas filters toe (inclusief nummerblokken)
                 filtered_df = drs_per_user_df.copy()
                 if selected_users: filtered_df = filtered_df[filtered_df['User Name'].isin(selected_users)]
                 if selected_departments: filtered_df = filtered_df[filtered_df['User Department'].isin(selected_departments)]
                 if selected_onderdelen: filtered_df = filtered_df[filtered_df['Onderdeel'].isin(selected_onderdelen)]
                 if selected_types: filtered_df = filtered_df[filtered_df['Reached Via Type'].isin(selected_types)]
+                if selected_did_blokken: filtered_df = filtered_df[filtered_df['Nummerblok(ken) DID'].isin(selected_did_blokken)] 
+                if selected_outbound_blokken: filtered_df = filtered_df[filtered_df['Nummerblok OutboundCID'].isin(selected_outbound_blokken)] 
 
-                st.dataframe(filtered_df, use_container_width=True)
+                st.dataframe(filtered_df, use_container_width=True, 
+                             column_order=["User Name", "User Number", "User Department", "Nummerblok(ken) DID", "Nummerblok OutboundCID", "Reached Via Type", "Reached Via Name", "Reached Via Ext", "Onderdeel"])
 
 else:
     st.info("Wacht op upload van ZIP-bestand...")
