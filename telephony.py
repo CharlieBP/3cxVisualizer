@@ -53,6 +53,65 @@ def normalize_nl_number(number_str):
     except (ValueError, TypeError):
         return None
 
+def get_user_details_for_csv(user_identifier, identifier_type, all_data, flow_context,
+                             reached_via_type=None, reached_via_name=None, reached_via_ext=None):
+    """
+    Haalt gebruikersdetails op voor CSV-export.
+    user_identifier: Kan een user number of user name zijn.
+    identifier_type: "Number" of "Naam".
+    all_data: De volledige dataset.
+    flow_context: Context van de flow (Onderdeel naam of DR extensie).
+    """
+    users_df = all_data.get("users", pd.DataFrame())
+    nummerblok_ranges = all_data.get("nummerblok_ranges", []) # Moet gevuld zijn vanuit load_data
+    if users_df.empty:
+        return None
+
+    user_info_series = None
+    if identifier_type == "Number":
+        # Zorg ervoor dat user_identifier een string is voor de vergelijking, net als de 'Number' kolom
+        match = users_df[users_df["Number"] == str(user_identifier)]
+        if not match.empty:
+            user_info_series = match.iloc[0]
+    elif identifier_type == "Naam":
+        match = users_df[users_df["Naam"] == str(user_identifier)] # 'Naam' is al een string
+        if not match.empty:
+            user_info_series = match.iloc[0]
+
+    if user_info_series is not None:
+        # Gebruik de globale find_nummerblok_for_number functie
+        did_s = str(user_info_series.get('DID', ''))
+        ob_cid = str(user_info_series.get('OutboundCallerID', ''))
+        did_blokken_found = set()
+        if did_s:
+            for did_part in did_s.split(':'): # Kan meerdere DIDs bevatten, gescheiden door ':'
+                blok = find_nummerblok_for_number(did_part.strip(), nummerblok_ranges)
+                if blok: did_blokken_found.add(blok)
+        outbound_blok_gevonden = find_nummerblok_for_number(ob_cid, nummerblok_ranges)
+        did_blokken_str = ", ".join(sorted(list(did_blokken_found))) if did_blokken_found else ""
+        outbound_blok_str = outbound_blok_gevonden if outbound_blok_gevonden else ""
+
+        department = user_info_series.get('Department', 'Geen Afdeling')
+        if pd.isna(department) or str(department).strip() == "":
+            department = "Geen Afdeling"
+
+        return {
+            "FlowContext": flow_context,
+            "User Name": user_info_series.get('Naam', ''),
+            "User Number": user_info_series.get('Number', ''),
+            "User Department": str(department),
+            "Mobile": str(user_info_series.get('MobileNumber', '')),
+            "Email": str(user_info_series.get('EmailAddress', '')),
+            "DID": did_s, # Volledige DID string
+            "Outbound CID": ob_cid, # Volledige Outbound CID
+            "Nummerblok(ken) DID": did_blokken_str,
+            "Nummerblok OutboundCID": outbound_blok_str,
+            "Reached Via Type": str(reached_via_type) if reached_via_type else "",
+            "Reached Via Name": str(reached_via_name) if reached_via_name else "",
+            "Reached Via Ext": str(reached_via_ext) if reached_via_ext else ""
+        }
+    return None
+
 # --- Data laad functie (uit ZIP) ---
 @st.cache_data
 def load_data_from_zip(zip_file_bytes):
@@ -378,9 +437,25 @@ if all_data:
 
     def make_node_id_refactored(prefix, identifier, context):
         """Genereert een unieke node ID met context (onderdeel of DR ext)."""
-        safe_identifier = re.sub(r'\\W+', '_', str(identifier))
-        safe_context = re.sub(r'\\W+', '_', str(context))
-        return f"{prefix}_{safe_context}_{safe_identifier[:30]}"
+        # Converteer alles expliciet naar string en vervang eerst backslashes
+        s_identifier = str(identifier).replace("\\", "_")
+        s_context = str(context).replace("\\", "_")
+        s_prefix = str(prefix).replace("\\", "_")
+
+        # Verwijder alle karakters die geen letter, cijfer of underscore zijn
+        safe_identifier = re.sub(r'[^a-zA-Z0-9_]', '_', s_identifier)
+        safe_context = re.sub(r'[^a-zA-Z0-9_]', '_', s_context)
+        safe_prefix = re.sub(r'[^a-zA-Z0-9_]', '_', s_prefix)
+
+        # Zorg dat het niet start/eindigt met underscore en geen dubbele underscores
+        temp_id = f"{safe_prefix}_{safe_context}_{safe_identifier[:30]}"
+        temp_id = re.sub(r'_+', '_', temp_id) # Vervang multiple underscores met enkele
+        temp_id = temp_id.strip('_') # Verwijder leading/trailing underscores
+        
+        # Fallback als ID leeg wordt na opschonen
+        if not temp_id:
+            return f"empty_node_{np.random.randint(100000)}"
+        return temp_id
 
     added_nodes_global = set() # Houdt nodes bij over meerdere grafieken indien nodig, of reset per grafiek.
     added_edges_global = set() # Idem voor edges.
@@ -392,64 +467,123 @@ if all_data:
              added_nodes_set.add(node_id)
          return node_id
 
-    def draw_destination_refactored(dot_graph, source_node_id, edge_label, dest_string, current_all_data, context, added_nodes_set, added_edges_set, depth=0, max_depth=10, visited_paths=None):
-        """Tekent een pijl naar een bestemming en volgt recursief (met diepte limiet en cyclus detectie)."""
+    # Aangepaste signatuur en logica voor gebruikers-CSV
+    def draw_destination_refactored(dot_graph, source_node_id, 
+                                    source_node_label, source_node_type, 
+                                    edge_label, dest_string, current_all_data, context, 
+                                    flow_context_for_csv, users_in_flow_set, users_in_flow_data_list, 
+                                    # Hernoemd voor duidelijkheid en correcte scope
+                                    current_added_nodes, current_added_edges, 
+                                    depth=0, max_depth=10, visited_paths=None):
+        """Tekent een pijl naar een bestemming en volgt recursief, en verzamelt GEBRUIKERSdata voor CSV export."""
+        
         if depth > max_depth:
             max_depth_node_id = make_node_id_refactored("MAXDEPTH", f"{source_node_id}_{edge_label}", context)
-            create_or_get_node_refactored(dot_graph, max_depth_node_id, "Max Recursion Depth Reached", added_nodes_set, shape='octagon', fillcolor='orange')
+            create_or_get_node_refactored(dot_graph, max_depth_node_id, "Max Recursion Depth Reached", current_added_nodes, shape='octagon', fillcolor='orange') # Gebruik current_added_nodes
             edge_key = (source_node_id, max_depth_node_id, edge_label + " (max depth)")
-            if edge_key not in added_edges_set:
+            if edge_key not in current_added_edges: # Gebruik current_added_edges
                 dot_graph.edge(source_node_id, max_depth_node_id, label=edge_label + " (max depth)")
-                added_edges_set.add(edge_key)
+                current_added_edges.add(edge_key) # Gebruik current_added_edges
             return
 
         if visited_paths is None: visited_paths = set()
 
         dest_type, dest_id = parse_destination(dest_string)
         path_key = (source_node_id, dest_type, dest_id)
-
-        # --- Opschonen Edge Label voor Node ID --- 
-        # Verwijder potentieel problematische tekens voordat ze in node ID komen
+        
         safe_edge_label_for_id = edge_label.replace(' ','_').replace('/','_').replace('\n','_')\
                                           .replace('(','').replace(')','').replace(':','')\
-                                          .replace("\\", "_") # Vervang expliciet backslash
-        # --- Einde Opschonen ---
+                                          .replace("\\", "_")
 
-        # Basis geval: geen bestemming
         if not dest_type:
-            # Gebruik opgeschoonde label voor ID
             target_node_id = make_node_id_refactored("END", f"{source_node_id}_{safe_edge_label_for_id}", context)
             target_label, target_shape, target_color, _ = get_node_label_and_style(None, "EndCall", current_all_data)
-            create_or_get_node_refactored(dot_graph, target_node_id, target_label, added_nodes_set, shape=target_shape, fillcolor=target_color)
+            create_or_get_node_refactored(dot_graph, target_node_id, target_label, current_added_nodes, shape=target_shape, fillcolor=target_color) # Gebruik current_added_nodes
             edge_key = (source_node_id, target_node_id, edge_label)
-            if edge_key not in added_edges_set: dot_graph.edge(source_node_id, target_node_id, label=edge_label); added_edges_set.add(edge_key)
+            if edge_key not in current_added_edges: # Gebruik current_added_edges
+                dot_graph.edge(source_node_id, target_node_id, label=edge_label)
+                current_added_edges.add(edge_key) # Gebruik current_added_edges
             return
         
         if path_key in visited_paths:
-             # Teken pijl naar bestaande node maar volg niet opnieuw (cyclus)
-             target_node_id = make_node_id_refactored(f"DEST_{dest_type}", f"{dest_id}_{edge_label.replace(' ','_').replace('/','_')}", context) # Gebruik bestaand ID format
-             # Controleer of de target node al bestaat (zou moeten als het een cyclus is)
-             if target_node_id in added_nodes_set:
+             target_node_id = make_node_id_refactored(f"DEST_{dest_type}", f"{dest_id}_{safe_edge_label_for_id}", context)
+             if target_node_id in current_added_nodes: # Gebruik current_added_nodes
                  edge_key = (source_node_id, target_node_id, edge_label + " (cycle)")
-                 if edge_key not in added_edges_set:
+                 if edge_key not in current_added_edges: # Gebruik current_added_edges
                       dot_graph.edge(source_node_id, target_node_id, label=edge_label + " (cycle)", style='dashed', color='grey')
-                      added_edges_set.add(edge_key)
-             # Else: iets klopt niet, teken normale pijl maar log evt.
-             return # Stop recursie hier
+                      current_added_edges.add(edge_key) # Gebruik current_added_edges
+             return 
 
         visited_paths.add(path_key)
 
-        # Teken de node en pijl voor de huidige bestemming
-        target_node_id = make_node_id_refactored(f"DEST_{dest_type}", f"{dest_id}_{edge_label.replace(' ','_').replace('/','_')}", context)
+        target_node_id = make_node_id_refactored(f"DEST_{dest_type}", f"{dest_id}_{safe_edge_label_for_id}", context)
         target_label, target_shape, target_color, target_node_type = get_node_label_and_style(dest_id, dest_type, current_all_data)
-        create_or_get_node_refactored(dot_graph, target_node_id, target_label, added_nodes_set, shape=target_shape, fillcolor=target_color)
+        create_or_get_node_refactored(dot_graph, target_node_id, target_label, current_added_nodes, shape=target_shape, fillcolor=target_color) # Gebruik current_added_nodes
         edge_key = (source_node_id, target_node_id, edge_label)
-        if edge_key not in added_edges_set:
+        if edge_key not in current_added_edges: # Gebruik current_added_edges
             dot_graph.edge(source_node_id, target_node_id, label=edge_label)
-            added_edges_set.add(edge_key)
+            current_added_edges.add(edge_key) # Gebruik current_added_edges
+        
+        # --- VERZAMEL GEBRUIKERSDATA --- 
+        if target_node_type == "User":
+            # Gebruik dest_id (extensienummer) voor de key in de set
+            user_key_tuple = (str(dest_id), flow_context_for_csv, "DIRECT") # DIRECT om te onderscheiden van Q/RG leden
+            if user_key_tuple not in users_in_flow_set:
+                # Gebruiker direct bereikt, geen Reached Via info nodig hier (wordt default None)
+                user_details = get_user_details_for_csv(dest_id, "Number", current_all_data, flow_context_for_csv)
+                if user_details:
+                    users_in_flow_data_list.append(user_details)
+                    users_in_flow_set.add(user_key_tuple)
+        
+        elif target_node_type == "Queue":
+            queues_df_local = current_all_data.get("queues", pd.DataFrame())
+            if not queues_df_local.empty and dest_id:
+                queue_match = queues_df_local[queues_df_local["Virtual Extension Number"] == str(dest_id)]
+                if not queue_match.empty:
+                    queue_info = queue_match.iloc[0]
+                    q_name = queue_info.get('Queue Name', f'Queue {dest_id}')
+                    q_ext = str(dest_id) # dest_id is al de queue extensie
+                    for col_name in queue_info.index:
+                        if col_name.startswith("User ") and pd.notna(queue_info[col_name]):
+                            user_name_in_queue = str(queue_info[col_name])
+                            users_df_local = current_all_data.get("users", pd.DataFrame())
+                            user_member_match = users_df_local[users_df_local["Naam"] == user_name_in_queue]
+                            if not user_member_match.empty:
+                                user_member_number = user_member_match.iloc[0].get("Number")
+                                if user_member_number:
+                                    # Key voor de set: user number, flow context, en via welke Q/RG
+                                    user_key_tuple = (str(user_member_number), flow_context_for_csv, f"QUEUE_{q_ext}")
+                                    if user_key_tuple not in users_in_flow_set:
+                                        user_details = get_user_details_for_csv(user_name_in_queue, "Naam", current_all_data, flow_context_for_csv,
+                                        # Haal details op basis van naam, want dat is wat we hebben uit de queue CSV
+                                        user_details = get_user_details_for_csv(user_name_in_queue, "Naam", current_all_data, flow_context_for_csv)
+                                        if user_details:
+                                            users_in_flow_data_list.append(user_details)
+                                            users_in_flow_set.add(user_key_tuple)
+        
+        elif target_node_type == "RingGroup":
+            ringgroups_df_local = current_all_data.get("ringgroups", pd.DataFrame())
+            if not ringgroups_df_local.empty and dest_id:
+                rg_match = ringgroups_df_local[ringgroups_df_local["Virtual Extension Number"] == str(dest_id)]
+                if not rg_match.empty:
+                    rg_info = rg_match.iloc[0]
+                    for col_name in rg_info.index:
+                        if col_name.startswith("User ") and pd.notna(rg_info[col_name]):
+                            user_name_in_rg = str(rg_info[col_name])
+                            users_df_local = current_all_data.get("users", pd.DataFrame())
+                            user_member_match = users_df_local[users_df_local["Naam"] == user_name_in_rg]
+                            if not user_member_match.empty:
+                                user_member_number = user_member_match.iloc[0].get("Number")
+                                if user_member_number:
+                                    user_key_tuple = (str(user_member_number), flow_context_for_csv)
+                                    if user_key_tuple not in users_in_flow_set:
+                                        user_details = get_user_details_for_csv(user_name_in_rg, "Naam", current_all_data, flow_context_for_csv)
+                                        if user_details:
+                                            users_in_flow_data_list.append(user_details)
+                                            users_in_flow_set.add(user_key_tuple)
+        # --- EINDE VERZAMEL GEBRUIKERSDATA ---
 
-        # --- Recursief volgen --- 
-        # Haal dataframes op
+        # --- Recursief volgen (parameters voor users_in_flow_... meegeven) ---
         queues_df = current_all_data.get("queues", pd.DataFrame())
         ringgroups_df = current_all_data.get("ringgroups", pd.DataFrame())
         receptionists_df_all = current_all_data.get("receptionists_all", pd.DataFrame())
@@ -461,66 +595,49 @@ if all_data:
                 queue_info = queue_match.iloc[0]
                 noans_dest = queue_info.get("Destination if no answer", np.nan)
                 if pd.notna(noans_dest):
-                    # Volg de 'no answer' bestemming
-                    draw_destination_refactored(dot_graph, target_node_id, "No Answer", noans_dest, current_all_data, context, added_nodes_set, added_edges_set, depth + 1, max_depth, visited_paths.copy())
+                    draw_destination_refactored(dot_graph, target_node_id, target_label, target_node_type, "No Answer", noans_dest, current_all_data, context, flow_context_for_csv, users_in_flow_set, users_in_flow_data_list, added_nodes_onderdeel, added_edges_onderdeel, depth + 1, max_depth, visited_paths.copy())
 
         # Als bestemming een Ring Group is
         elif target_node_type == "RingGroup" and dest_id and not ringgroups_df.empty:
-            rg_match = ringgroups_df[ringgroups_df["Virtual Extension Number"] == str(dest_id)]
+            rg_match = ringgroups_df[ringgroups_df["Virtual Extension Number"] == str(dest_id)] # Herhaalde lookup
             if not rg_match.empty:
                 rg_info = rg_match.iloc[0]
                 noans_dest = rg_info.get("Destination if no answer", np.nan)
                 if pd.notna(noans_dest):
-                    # Volg de 'no answer' bestemming
-                    draw_destination_refactored(dot_graph, target_node_id, "No Answer", noans_dest, current_all_data, context, added_nodes_set, added_edges_set, depth + 1, max_depth, visited_paths.copy())
+                    draw_destination_refactored(dot_graph, target_node_id, target_label, target_node_type, "No Answer", noans_dest, current_all_data, context, flow_context_for_csv, users_in_flow_set, users_in_flow_data_list, added_nodes_onderdeel, added_edges_onderdeel, depth + 1, max_depth, visited_paths.copy())
 
         # Als bestemming een DR is
         elif target_node_type == "DR" and dest_id and not receptionists_df_all.empty:
-            dr_match = receptionists_df_all[receptionists_df_all["Virtual Extension Number"] == str(dest_id)]
+            dr_match = receptionists_df_all[receptionists_df_all["Virtual Extension Number"] == str(dest_id)] # Herhaalde lookup
             if not dr_match.empty:
                 dr_info = dr_match.iloc[0]
-                # Volg alle mogelijke paden vanuit deze DR
-                dest_cols_recursive = ["When office is closed route to", "When on break route to",
-                                       "When on holiday route to", "When on holiday route to ",
-                                       "Send call to", "Invalid input destination"]
+                dest_cols_recursive = [("Office Closed", dr_info.get("When office is closed route to", np.nan)),
+                                     ("On Break", dr_info.get("When on break route to", np.nan)),
+                                     ("On Holiday", dr_info.get(next((col for col in ["When on holiday route to", "When on holiday route to "] if col in dr_info.index), "non_existing_col"), np.nan))]
                 menu_options_exist = False
                 for i in range(10):
                      menu_col = f"Menu {i}"
                      if menu_col in dr_info and pd.notna(dr_info[menu_col]) and str(dr_info[menu_col]).strip():
-                        dest_cols_recursive.append(menu_col)
+                        dest_cols_recursive.append((f"Menu {i}", dr_info.get(menu_col, np.nan)))
                         menu_options_exist = True
                 
-                # Bepaal startpunt voor recursie binnen DR (tijd checks of direct menu/default)
-                # Dit deel is complex, voor nu volgen we alle directe bestemmingen
-                # Een accuratere implementatie zou de tijdchecks *binnen* de recursie moeten evalueren
-                # of de structuur van de draw_destination aanpassen.
-                # Voor nu: volg directe bestemmingen uit de DR info.
-                
-                # Tijd-gebaseerde routes (als startpunten voor recursie vanaf *deze* DR)
-                draw_destination_refactored(dot_graph, target_node_id, "Office Closed", dr_info.get("When office is closed route to", np.nan), current_all_data, f"{context}_r{depth}", added_nodes_set, added_edges_set, depth + 1, max_depth, visited_paths.copy())
-                draw_destination_refactored(dot_graph, target_node_id, "On Break", dr_info.get("When on break route to", np.nan), current_all_data, f"{context}_r{depth}", added_nodes_set, added_edges_set, depth + 1, max_depth, visited_paths.copy())
-                holiday_dest = dr_info.get(next((col for col in ["When on holiday route to", "When on holiday route to "] if col in dr_info.index), "non_existing_col"), np.nan)
-                draw_destination_refactored(dot_graph, target_node_id, "On Holiday", holiday_dest, current_all_data, f"{context}_r{depth}", added_nodes_set, added_edges_set, depth + 1, max_depth, visited_paths.copy())
-
-                # Menu opties / Default / Invalid (als startpunten voor recursie)
                 if menu_options_exist:
-                    for i in range(10):
-                        menu_col = f"Menu {i}"
-                        menu_dest = dr_info.get(menu_col, np.nan)
-                        if pd.notna(menu_dest) and str(menu_dest).strip():
-                            draw_destination_refactored(dot_graph, target_node_id, f"Menu {i}", menu_dest, current_all_data, f"{context}_r{depth}", added_nodes_set, added_edges_set, depth + 1, max_depth, visited_paths.copy())
-                    
-                    default_dest = dr_info.get("Send call to", np.nan)
-                    draw_destination_refactored(dot_graph, target_node_id, "Timeout/Default", default_dest, current_all_data, f"{context}_r{depth}", added_nodes_set, added_edges_set, depth + 1, max_depth, visited_paths.copy())
-                    
-                    invalid_dest = dr_info.get("Invalid input destination", np.nan)
-                    if pd.notna(invalid_dest) and invalid_dest != default_dest:
-                        draw_destination_refactored(dot_graph, target_node_id, "Invalid Input", invalid_dest, current_all_data, f"{context}_r{depth}", added_nodes_set, added_edges_set, depth + 1, max_depth, visited_paths.copy())
-                else: # Geen menu, volg alleen default
-                    default_dest = dr_info.get("Send call to", np.nan)
-                    draw_destination_refactored(dot_graph, target_node_id, "Direct", default_dest, current_all_data, f"{context}_r{depth}", added_nodes_set, added_edges_set, depth + 1, max_depth, visited_paths.copy())
+                    dest_cols_recursive.append(("Timeout/Default", dr_info.get("Send call to", np.nan)))
+                    invalid_dest_val = dr_info.get("Invalid input destination", np.nan)
+                    # Voeg Invalid Input alleen toe als het verschilt van de default Send call to
+                    if pd.notna(invalid_dest_val) and invalid_dest_val != dr_info.get("Send call to", np.nan):
+                         dest_cols_recursive.append(("Invalid Input", invalid_dest_val))
+                else: # Geen menu, alleen default
+                    dest_cols_recursive.append(("Direct", dr_info.get("Send call to", np.nan)))
 
-        # Andere typen (User, EndCall, etc.) zijn eindpunten, geen verdere recursie nodig.
+                for edge_lbl_recursive, dest_str_recursive in dest_cols_recursive:
+                    if pd.notna(dest_str_recursive) and str(dest_str_recursive).strip():
+                         draw_destination_refactored(dot_graph, target_node_id, target_label, target_node_type, 
+                                                    edge_lbl_recursive, dest_str_recursive, current_all_data, 
+                                                    f"{context}_r{depth}", flow_context_for_csv, 
+                                                    users_in_flow_set, users_in_flow_data_list, 
+                                                    added_nodes_onderdeel, added_edges_onderdeel, 
+                                                    depth + 1, max_depth, visited_paths.copy())
 
     # --- Creëer tabs ---
     tab1, tab2, tab3 = st.tabs([
@@ -576,98 +693,156 @@ if all_data:
                         dot_onderdeel.attr('edge', fontname='Arial', fontsize='8')
                         added_nodes_onderdeel = set()
                         added_edges_onderdeel = set()
+                        # Nieuw voor gebruikers CSV per onderdeel-flow
+                        users_in_flow_set_onderdeel = set()
+                        users_in_flow_data_list_onderdeel = []
+                        flow_context_csv = onderdeel_naam # Gebruik de naam van het onderdeel als context
                         
                         # --- Teken de flow voor het Onderdeel (gebruik refactored helpers) ---
                         onderdeel_node_id = make_node_id_refactored("ONDERDEEL", onderdeel_safe_name, onderdeel_safe_name)
-                        create_or_get_node_refactored(dot_onderdeel, onderdeel_node_id, f"🏢 Onderdeel:\\n{onderdeel_naam}", added_nodes_onderdeel, shape='tab', fillcolor='lightblue')
+                        onderdeel_node_label = f"🏢 Onderdeel:\n{onderdeel_naam}"
+                        create_or_get_node_refactored(dot_onderdeel, onderdeel_node_id, onderdeel_node_label, added_nodes_onderdeel, shape='tab', fillcolor='lightblue')
 
                         primaire_drs_in_onderdeel = onderdeel_group_df[onderdeel_group_df['Primair/Secundair'] == 'Primair']
                         start_drs_df = primaire_drs_in_onderdeel
                         start_label_prefix = "Start bij Primaire DR:"
                         if primaire_drs_in_onderdeel.empty:
-                            start_drs_df = onderdeel_group_df
+                            start_drs_df = onderdeel_group_df # Alle DRs in onderdeel als geen primaire
                             start_label_prefix = "Start bij DR:"
 
                         if start_drs_df.empty:
                              st.warning(f"Geen DRs gevonden voor onderdeel '{onderdeel_naam}' in deze groep.")
+                             # Toch de download knop tonen, ook al is de lijst leeg
+                             if users_in_flow_data_list_onderdeel:
+                                df_onderdeel_users = pd.DataFrame(users_in_flow_data_list_onderdeel)
+                                csv_onderdeel_users = df_onderdeel_users.to_csv(index=False).encode('utf-8')
+                                st.download_button(
+                                    label=f"Download Gebruikers in Flow ({onderdeel_naam}) als CSV",
+                                    data=csv_onderdeel_users,
+                                    file_name=f'users_flow_{onderdeel_safe_name}.csv',
+                                    mime='text/csv',
+                                )
+                             else:
+                                st.info("Geen gebruikersdata om te downloaden voor deze flow.")
                              continue
                         
                         # Loop over start DRs binnen dit onderdeel
-                        for _, dr in start_drs_df.iterrows():
-                           # ... (Volledige logica voor het tekenen van de flow voor één DR binnen het onderdeel,
-                           #      inclusief menu-opties, timeouts, tijdchecks, en aanroepen naar draw_destination_refactored
-                           #      blijft hier binnen deze for-loop, correct ge-indent) ...
-                            dr_name = dr.get("Digital Receptionist Name", "Naamloos")
-                            dr_ext = dr.get("Virtual Extension Number", "GEEN_EXT")
+                        for _, dr_row in start_drs_df.iterrows(): # Gebruik dr_row om verwarring met dr (dataframe) te voorkomen
+                            dr_name = dr_row.get("Digital Receptionist Name", "Naamloos")
+                            dr_ext = dr_row.get("Virtual Extension Number", "GEEN_EXT")
                             if dr_ext == "GEEN_EXT" or pd.isna(dr_ext): continue
                             dr_ext_str = str(dr_ext)
                             context_id = f"{onderdeel_safe_name}_{dr_ext_str}"
-                            menu_options_strings = {}
-                            has_menu = False
-                            for i in range(10):
-                                menu_col = f"Menu {i}"
-                                if menu_col in dr.index and pd.notna(dr[menu_col]) and str(dr[menu_col]).strip():
-                                    menu_options_strings[i] = dr[menu_col]
-                                    has_menu = True
-                            ivr_timeout_sec_val = dr.get("If no input within seconds", None)
+                            
+                            # Label en type van de DR node zelf (de bron voor de eerste set verbindingen)
+                            dr_node_id = make_node_id_refactored("DR", dr_ext_str, context_id)
+                            ivr_timeout_sec_val = dr_row.get("If no input within seconds", None)
                             ivr_timeout_num = pd.to_numeric(ivr_timeout_sec_val, errors='coerce')
                             ivr_timeout_info = ""
+                            has_menu = any(pd.notna(dr_row.get(f"Menu {i}")) and str(dr_row.get(f"Menu {i}")).strip() for i in range(10))
                             if has_menu and pd.notna(ivr_timeout_num):
                                 ivr_timeout_info = f"\\nTimeout: {int(ivr_timeout_num)}s"
-                            dr_node_id = make_node_id_refactored("DR", dr_ext_str, context_id)
-                            dr_label = f"🚦 IVR: {dr_name}\\n({dr_ext_str}){ivr_timeout_info}"
-                            _, dr_shape, dr_color, _ = get_node_label_and_style(dr_ext_str, "DR", all_data)
-                            create_or_get_node_refactored(dot_onderdeel, dr_node_id, dr_label, added_nodes_onderdeel, shape=dr_shape, fillcolor=dr_color)
-                            edge_key = (onderdeel_node_id, dr_node_id, start_label_prefix)
-                            if edge_key not in added_edges_onderdeel:
+                            
+                            initial_dr_label_for_graph, dr_shape, dr_color, initial_dr_node_type = get_node_label_and_style(dr_ext_str, "DR", all_data)
+                            # Herdefinieer label voor de node zelf om consistent te zijn met get_node_label_and_style output
+                            # De dr_label die we gebruiken als source_node_label moet het *daadwerkelijke* label zijn.
+                            actual_dr_node_label = f"🚦 IVR: {dr_name}\n({dr_ext_str}){ivr_timeout_info}" 
+                            create_or_get_node_refactored(dot_onderdeel, dr_node_id, actual_dr_node_label, added_nodes_onderdeel, shape=dr_shape, fillcolor=dr_color)
+                            
+                            edge_key_onderdeel_dr = (onderdeel_node_id, dr_node_id, start_label_prefix)
+                            if edge_key_onderdeel_dr not in added_edges_onderdeel:
                                  dot_onderdeel.edge(onderdeel_node_id, dr_node_id, label=start_label_prefix)
-                                 added_edges_onderdeel.add(edge_key)
+                                 added_edges_onderdeel.add(edge_key_onderdeel_dr)
+
+                            # --- Check direct users from this DR (als DR zelf user/queue/rg is) ---
+                            # Dit is onwaarschijnlijk voor een DR, maar voor de volledigheid.
+                            # De main logic in draw_destination zal dit voor volgende stappen afhandelen.
+                            if initial_dr_node_type == "User": # Onwaarschijnlijk, DRs zijn geen users
+                                user_key_tuple = (dr_ext_str, flow_context_csv)
+                                if user_key_tuple not in users_in_flow_set_onderdeel:
+                                    user_details = get_user_details_for_csv(dr_ext_str, "Number", all_data, flow_context_csv)
+                                    if user_details: 
+                                        users_in_flow_data_list_onderdeel.append(user_details)
+                                        users_in_flow_set_onderdeel.add(user_key_tuple)
+                            # Check voor Queues/RGs leden als de DR daarheen zou wijzen (hier niet direct van toepassing)
+
+                            # --- Tijd conditionele checks --- 
+                            # Bron voor deze checks is de DR node
+                            current_source_node_id = dr_node_id
+                            current_source_label = actual_dr_node_label # Gebruik het label dat we net hebben gemaakt
+                            current_source_type = initial_dr_node_type # Type van de DR zelf
+
                             office_check_node_id = make_node_id_refactored("OFFICECHECK", dr_ext_str, context_id)
-                            _, office_shape, office_color, _ = get_node_label_and_style("", "Check", all_data)
-                            create_or_get_node_refactored(dot_onderdeel, office_check_node_id, "Binnen kantooruren?", added_nodes_onderdeel, shape=office_shape, fillcolor=office_color)
-                            edge_key = (dr_node_id, office_check_node_id)
-                            if edge_key not in added_edges_onderdeel: dot_onderdeel.edge(dr_node_id, office_check_node_id); added_edges_onderdeel.add(edge_key)
-                            break_check_node_id = make_node_id_refactored("BREAKCHECK", dr_ext_str, context_id)
-                            create_or_get_node_refactored(dot_onderdeel, break_check_node_id, "Pauze actief?", added_nodes_onderdeel, shape=office_shape, fillcolor=office_color)
-                            edge_key = (office_check_node_id, break_check_node_id, "Ja")
-                            if edge_key not in added_edges_onderdeel: dot_onderdeel.edge(office_check_node_id, break_check_node_id, label="Ja"); added_edges_onderdeel.add(edge_key)
-                            holiday_check_node_id = make_node_id_refactored("HOLIDAYCHECK", dr_ext_str, context_id)
-                            create_or_get_node_refactored(dot_onderdeel, holiday_check_node_id, "Vakantie actief?", added_nodes_onderdeel, shape=office_shape, fillcolor=office_color)
-                            edge_key = (break_check_node_id, holiday_check_node_id, "Nee")
-                            if edge_key not in added_edges_onderdeel: dot_onderdeel.edge(break_check_node_id, holiday_check_node_id, label="Nee"); added_edges_onderdeel.add(edge_key)
-                            in_hours_node_id = make_node_id_refactored("INHOURS", dr_ext_str, context_id)
-                            create_or_get_node_refactored(dot_onderdeel, in_hours_node_id, "Actie binnen kantooruren", added_nodes_onderdeel, shape='ellipse', fillcolor='lightgrey')
-                            edge_key = (holiday_check_node_id, in_hours_node_id, "Nee")
-                            if edge_key not in added_edges_onderdeel: dot_onderdeel.edge(holiday_check_node_id, in_hours_node_id, label="Nee"); added_edges_onderdeel.add(edge_key)
-                            dest_strings = {
-                                'closed': dr.get("When office is closed route to", np.nan),
-                                'break': dr.get("When on break route to", np.nan),
-                                'holiday': dr.get(next((col for col in ["When on holiday route to", "When on holiday route to "] if col in dr.index), "non_existing_col"), np.nan),
-                                'default': dr.get("Send call to", np.nan),
-                                'invalid': dr.get("Invalid input destination", np.nan)
+                            office_check_label = "Binnen kantooruren?"
+                            _, office_shape, office_color, office_node_type = get_node_label_and_style("", "Check", all_data) # Type is 'Check' of iets generieks
+                            create_or_get_node_refactored(dot_onderdeel, office_check_node_id, office_check_label, added_nodes_onderdeel, shape=office_shape, fillcolor=office_color)
+                            edge_key_dr_office = (current_source_node_id, office_check_node_id)
+                            if edge_key_dr_office not in added_edges_onderdeel: 
+                                dot_onderdeel.edge(current_source_node_id, office_check_node_id)
+                                added_edges_onderdeel.add(edge_key_dr_office)
+                            
+                            # Bestemmingen vanuit de DR (via de tijdchecks)
+                            dest_strings_dr = {
+                                'closed': dr_row.get("When office is closed route to", np.nan),
+                                'break': dr_row.get("When on break route to", np.nan),
+                                'holiday': dr_row.get(next((col for col in ["When on holiday route to", "When on holiday route to "] if col in dr_row.index), "non_existing_col"), np.nan)
                             }
-                            draw_destination_refactored(dot_onderdeel, office_check_node_id, "Nee", dest_strings['closed'], all_data, context_id, added_nodes_onderdeel, added_edges_onderdeel, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Check", "OFFICECHECK")]))
-                            draw_destination_refactored(dot_onderdeel, break_check_node_id, "Ja", dest_strings['break'], all_data, context_id, added_nodes_onderdeel, added_edges_onderdeel, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Check", "BREAKCHECK")]))
-                            holiday_type, _ = parse_destination(dest_strings['holiday'])
-                            if holiday_type:
-                                draw_destination_refactored(dot_onderdeel, holiday_check_node_id, "Ja", dest_strings['holiday'], all_data, context_id, added_nodes_onderdeel, added_edges_onderdeel, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Check", "HOLIDAYCHECK")]))
-                            else:
-                                edge_key = (holiday_check_node_id, in_hours_node_id, "Ja (geen route)")
-                                if edge_key not in added_edges_onderdeel:
-                                    dot_onderdeel.edge(holiday_check_node_id, in_hours_node_id, label="Ja (geen route)")
-                                    added_edges_onderdeel.add(edge_key)
-                            ivr_timeout_edge_label_part = f" ({int(ivr_timeout_num)}s)" if pd.notna(ivr_timeout_num) else ""
+                            # Aanroep naar draw_destination voor 'Office Closed' (Nee vanuit office_check_node)
+                            draw_destination_refactored(dot_onderdeel, office_check_node_id, office_check_label, office_node_type, "Nee (Gesloten)", dest_strings_dr['closed'], all_data, context_id, flow_context_csv, users_in_flow_set_onderdeel, users_in_flow_data_list_onderdeel, added_nodes_onderdeel, added_edges_onderdeel, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Check", office_check_node_id)]))
+                            
+                            # Ja vanuit office_check_node -> naar break_check_node
+                            break_check_node_id = make_node_id_refactored("BREAKCHECK", dr_ext_str, context_id)
+                            break_check_label = "Pauze actief?"
+                            _, break_shape, break_color, break_node_type = get_node_label_and_style("", "Check", all_data)
+                            create_or_get_node_refactored(dot_onderdeel, break_check_node_id, break_check_label, added_nodes_onderdeel, shape=break_shape, fillcolor=break_color)
+                            edge_key_office_break = (office_check_node_id, break_check_node_id, "Ja")
+                            if edge_key_office_break not in added_edges_onderdeel: 
+                                dot_onderdeel.edge(office_check_node_id, break_check_node_id, label="Ja")
+                                added_edges_onderdeel.add(edge_key_office_break)
+                            # Aanroep naar draw_destination voor 'On Break' (Ja vanuit break_check_node)
+                            draw_destination_refactored(dot_onderdeel, break_check_node_id, break_check_label, break_node_type, "Ja (Pauze)", dest_strings_dr['break'], all_data, context_id, flow_context_csv, users_in_flow_set_onderdeel, users_in_flow_data_list_onderdeel, added_nodes_onderdeel, added_edges_onderdeel, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Check", break_check_node_id)]))
+
+                            # Nee vanuit break_check_node -> naar holiday_check_node
+                            holiday_check_node_id = make_node_id_refactored("HOLIDAYCHECK", dr_ext_str, context_id)
+                            holiday_check_label = "Vakantie actief?"
+                            _, holiday_shape, holiday_color, holiday_node_type = get_node_label_and_style("", "Check", all_data)
+                            create_or_get_node_refactored(dot_onderdeel, holiday_check_node_id, holiday_check_label, added_nodes_onderdeel, shape=holiday_shape, fillcolor=holiday_color)
+                            edge_key_break_holiday = (break_check_node_id, holiday_check_node_id, "Nee")
+                            if edge_key_break_holiday not in added_edges_onderdeel: 
+                                dot_onderdeel.edge(break_check_node_id, holiday_check_node_id, label="Nee")
+                                added_edges_onderdeel.add(edge_key_break_holiday)
+                            # Aanroep naar draw_destination voor 'On Holiday' (Ja vanuit holiday_check_node)
+                            draw_destination_refactored(dot_onderdeel, holiday_check_node_id, holiday_check_label, holiday_node_type, "Ja (Vakantie)", dest_strings_dr['holiday'], all_data, context_id, flow_context_csv, users_in_flow_set_onderdeel, users_in_flow_data_list_onderdeel, added_nodes_onderdeel, added_edges_onderdeel, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Check", holiday_check_node_id)]))
+
+                            # Nee vanuit holiday_check_node -> naar in_hours_node (menu/default)
+                            in_hours_node_id = make_node_id_refactored("INHOURS", dr_ext_str, context_id)
+                            in_hours_label = "Actie binnen kantooruren" if not has_menu else "🎶 Menu speelt..."
+                            create_or_get_node_refactored(dot_onderdeel, in_hours_node_id, in_hours_label, added_nodes_onderdeel, shape='ellipse', fillcolor='lightgrey')
+                            edge_key_holiday_inhours = (holiday_check_node_id, in_hours_node_id, "Nee")
+                            if edge_key_holiday_inhours not in added_edges_onderdeel: 
+                                dot_onderdeel.edge(holiday_check_node_id, in_hours_node_id, label="Nee")
+                                added_edges_onderdeel.add(edge_key_holiday_inhours)
+                            
+                            # Menu opties en default/invalid (bron is in_hours_node_id)
+                            menu_options_dr = []
                             if has_menu:
-                                create_or_get_node_refactored(dot_onderdeel, in_hours_node_id, "🎶 Menu speelt...", added_nodes_onderdeel)
-                                for key, dest_str in menu_options_strings.items():
-                                    draw_destination_refactored(dot_onderdeel, in_hours_node_id, f"Kies {key}", dest_str, all_data, context_id, added_nodes_onderdeel, added_edges_onderdeel, depth=1, max_depth=10, visited_paths=set([(dr_node_id, f"Menu {key}", f"Menu {key}")]))
-                                timeout_edge_label = f"Timeout{ivr_timeout_edge_label_part} /\\nGeen invoer"
-                                draw_destination_refactored(dot_onderdeel, in_hours_node_id, timeout_edge_label, dest_strings['default'], all_data, context_id, added_nodes_onderdeel, added_edges_onderdeel, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Timeout/Default", f"Timeout{ivr_timeout_edge_label_part}")]))
-                                if pd.notna(dest_strings['invalid']) and dest_strings['invalid'] != dest_strings['default']:
-                                     draw_destination_refactored(dot_onderdeel, in_hours_node_id, "Invalid", dest_strings['invalid'], all_data, context_id, added_nodes_onderdeel, added_edges_onderdeel, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Invalid Input", f"Invalid {dest_strings['invalid']}")]))
-                            else: 
-                                create_or_get_node_refactored(dot_onderdeel, in_hours_node_id, "Geen menu", added_nodes_onderdeel)
-                                draw_destination_refactored(dot_onderdeel, in_hours_node_id, "Direct", dest_strings['default'], all_data, context_id, added_nodes_onderdeel, added_edges_onderdeel, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Direct", f"Direct {dest_strings['default']}")]))
+                                for i in range(10):
+                                    menu_col = f"Menu {i}"
+                                    menu_dest_val = dr_row.get(menu_col, np.nan)
+                                    if pd.notna(menu_dest_val) and str(menu_dest_val).strip():
+                                        menu_options_dr.append((f"Kies {i}", menu_dest_val))
+                                menu_options_dr.append((f"Timeout{ivr_timeout_info.replace('\\n', ' ')} / Geen invoer", dr_row.get("Send call to", np.nan)))
+                                invalid_dest_dr = dr_row.get("Invalid input destination", np.nan)
+                                if pd.notna(invalid_dest_dr) and invalid_dest_dr != dr_row.get("Send call to", np.nan):
+                                    menu_options_dr.append(("Invalid Input", invalid_dest_dr))
+                            else: # Geen menu
+                                menu_options_dr.append(("Direct", dr_row.get("Send call to", np.nan)))
+
+                            for edge_lbl, dest_s in menu_options_dr:
+                                if pd.notna(dest_s) and str(dest_s).strip():
+                                    # De depth is hier 1 omdat we vanaf de in_hours_node starten, die zelf op depth 0 (relatief aan DR) is.
+                                    # max_depth wordt hier expliciet meegegeven.
+                                    draw_destination_refactored(dot_onderdeel, in_hours_node_id, in_hours_label, "InHoursAction", edge_lbl, dest_s, all_data, context_id, flow_context_csv, users_in_flow_set_onderdeel, users_in_flow_data_list_onderdeel, added_nodes_onderdeel, added_edges_onderdeel, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "InHours", in_hours_node_id)]))
                         
                         # Toon grafiek voor onderdeel (na de for-loop over DRs)
                         try:
@@ -675,6 +850,23 @@ if all_data:
                         except Exception as e:
                             st.error(f"Fout genereren grafiek voor onderdeel '{onderdeel_naam}': {e}")
                             st.code(dot_onderdeel.source, language='dot')
+                        
+                        # Download knop voor gebruikers in deze onderdeel-flow
+                        if users_in_flow_data_list_onderdeel:
+                            df_onderdeel_users = pd.DataFrame(users_in_flow_data_list_onderdeel)
+                            # Zorg voor unieke rijen voor het geval een gebruiker via meerdere directe paden in de lijst kwam
+                            # (Hoewel users_in_flow_set dit al grotendeels zou moeten afvangen op user_number-context niveau)
+                            df_onderdeel_users.drop_duplicates(inplace=True) 
+                            csv_onderdeel_users = df_onderdeel_users.to_csv(index=False).encode('utf-8')
+                            st.download_button(
+                                label=f"Download Gebruikers ({len(df_onderdeel_users)} regels) in Flow \"{onderdeel_naam}\" als CSV",
+                                data=csv_onderdeel_users,
+                                file_name=f'users_in_flow_{onderdeel_safe_name}.csv',
+                                mime='text/csv',
+                                key=f'download_onderdeel_{onderdeel_safe_name}' # Unieke key
+                            )
+                        else:
+                            st.info("Geen gebruikersdata gevonden in deze flow om te downloaden.")
             # Einde van: if not drs_met_geldig_onderdeel.empty:
             elif not drs_zonder_geldig_onderdeel.empty: # Alleen tonen als er *wel* ongeldige zijn maar *geen* geldige
                 st.info("Geen Digital Receptionists met een geldig Onderdeel gevonden. Controleer individuele flows hieronder.")
@@ -702,78 +894,119 @@ if all_data:
                         dot_individual.attr('edge', fontname='Arial', fontsize='8')
                         added_nodes_indiv = set()
                         added_edges_indiv = set()
+                        # Nieuw voor gebruikers CSV per individuele DR-flow
+                        users_in_flow_set_indiv = set()
+                        users_in_flow_data_list_indiv = []
+                        flow_context_csv_indiv = f"IVR_{dr_ext_str}_{dr_name.replace(' ','_')}" # Context voor CSV
 
-                        # ... (Logica voor tekenen flow individuele DR, vergelijkbaar met binnen onderdeel-loop,
-                        #      maar startend bij dr_node_id, correct ge-indent binnen deze with-expander) ...
-                        menu_options_strings = {}
-                        has_menu = False
+                        # Bepaal DR label en type (bron voor de eerste checks)
+                        menu_options_strings_indiv = {}
+                        has_menu_indiv = False
                         for i in range(10):
                             menu_col = f"Menu {i}"
                             if menu_col in dr.index and pd.notna(dr[menu_col]) and str(dr[menu_col]).strip():
-                                menu_options_strings[i] = dr[menu_col]
-                                has_menu = True
-                        ivr_timeout_sec_val = dr.get("If no input within seconds", None)
-                        ivr_timeout_num = pd.to_numeric(ivr_timeout_sec_val, errors='coerce')
-                        ivr_timeout_info = ""
-                        if has_menu and pd.notna(ivr_timeout_num):
-                            ivr_timeout_info = f"\\nTimeout: {int(ivr_timeout_num)}s"
-                        dr_node_id = make_node_id_refactored("DR", dr_ext_str, context_id)
-                        dr_label = f"🚦 IVR: {dr_name}\\n({dr_ext_str}){ivr_timeout_info}"
-                        _, dr_shape, dr_color, _ = get_node_label_and_style(dr_ext_str, "DR", all_data)
-                        create_or_get_node_refactored(dot_individual, dr_node_id, dr_label, added_nodes_indiv, shape=dr_shape, fillcolor=dr_color)
-                        office_check_node_id = make_node_id_refactored("OFFICECHECK", dr_ext_str, context_id)
-                        _, office_shape, office_color, _ = get_node_label_and_style("", "Check", all_data)
-                        create_or_get_node_refactored(dot_individual, office_check_node_id, "Binnen kantooruren?", added_nodes_indiv, shape=office_shape, fillcolor=office_color)
-                        edge_key = (dr_node_id, office_check_node_id)
-                        if edge_key not in added_edges_indiv: dot_individual.edge(dr_node_id, office_check_node_id); added_edges_indiv.add(edge_key)
-                        break_check_node_id = make_node_id_refactored("BREAKCHECK", dr_ext_str, context_id)
-                        create_or_get_node_refactored(dot_individual, break_check_node_id, "Pauze actief?", added_nodes_indiv, shape=office_shape, fillcolor=office_color)
-                        edge_key = (office_check_node_id, break_check_node_id, "Ja")
-                        if edge_key not in added_edges_indiv: dot_individual.edge(office_check_node_id, break_check_node_id, label="Ja"); added_edges_indiv.add(edge_key)
-                        holiday_check_node_id = make_node_id_refactored("HOLIDAYCHECK", dr_ext_str, context_id)
-                        create_or_get_node_refactored(dot_individual, holiday_check_node_id, "Vakantie actief?", added_nodes_indiv, shape=office_shape, fillcolor=office_color)
-                        edge_key = (break_check_node_id, holiday_check_node_id, "Nee")
-                        if edge_key not in added_edges_indiv: dot_individual.edge(break_check_node_id, holiday_check_node_id, label="Nee"); added_edges_indiv.add(edge_key)
-                        in_hours_node_id = make_node_id_refactored("INHOURS", dr_ext_str, context_id)
-                        create_or_get_node_refactored(dot_individual, in_hours_node_id, "Actie binnen kantooruren", added_nodes_indiv, shape='ellipse', fillcolor='lightgrey')
-                        edge_key = (holiday_check_node_id, in_hours_node_id, "Nee")
-                        if edge_key not in added_edges_indiv: dot_individual.edge(holiday_check_node_id, in_hours_node_id, label="Nee"); added_edges_indiv.add(edge_key)
-                        dest_strings = {
+                                menu_options_strings_indiv[i] = dr[menu_col] # Corrected
+                                has_menu_indiv = True # Corrected
+                        ivr_timeout_sec_val_indiv = dr.get("If no input within seconds", None)
+                        ivr_timeout_num_indiv = pd.to_numeric(ivr_timeout_sec_val_indiv, errors='coerce')
+                        ivr_timeout_info_indiv = ""
+                        if has_menu_indiv and pd.notna(ivr_timeout_num_indiv):
+                            ivr_timeout_info_indiv = f"\\nTimeout: {int(ivr_timeout_num_indiv)}s"
+                        
+                        dr_node_id_indiv = make_node_id_refactored("DR", dr_ext_str, context_id) # context_id is hier dr_ext_str
+                        actual_dr_label_indiv, dr_shape_indiv, dr_color_indiv, actual_dr_node_type_indiv = get_node_label_and_style(dr_ext_str, "DR", all_data)
+                        if ivr_timeout_info_indiv and ivr_timeout_info_indiv not in actual_dr_label_indiv:
+                            actual_dr_label_indiv = f"🚦 IVR: {dr_name}\n({dr_ext_str}){ivr_timeout_info_indiv}"
+
+                        create_or_get_node_refactored(dot_individual, dr_node_id_indiv, actual_dr_label_indiv, added_nodes_indiv, shape=dr_shape_indiv, fillcolor=dr_color_indiv)
+
+                        if actual_dr_node_type_indiv == "User":
+                            user_key_tuple = (dr_ext_str, flow_context_csv_indiv)
+                            if user_key_tuple not in users_in_flow_set_indiv:
+                                user_details = get_user_details_for_csv(dr_ext_str, "Number", all_data, flow_context_csv_indiv)
+                                if user_details: 
+                                    users_in_flow_data_list_indiv.append(user_details)
+                                    users_in_flow_set_indiv.add(user_key_tuple)
+                        
+                        office_check_node_id_indiv = make_node_id_refactored("OFFICECHECK", dr_ext_str, context_id)
+                        office_check_label_indiv = "Binnen kantooruren?"
+                        _, office_shape_indiv, office_color_indiv, office_node_type_indiv = get_node_label_and_style("", "Check", all_data)
+                        create_or_get_node_refactored(dot_individual, office_check_node_id_indiv, office_check_label_indiv, added_nodes_indiv, shape=office_shape_indiv, fillcolor=office_color_indiv)
+                        edge_key_dr_office_indiv = (dr_node_id_indiv, office_check_node_id_indiv)
+                        if edge_key_dr_office_indiv not in added_edges_indiv: 
+                            dot_individual.edge(dr_node_id_indiv, office_check_node_id_indiv)
+                            added_edges_indiv.add(edge_key_dr_office_indiv)
+                        
+                        dest_strings_indiv = {
                             'closed': dr.get("When office is closed route to", np.nan),
                             'break': dr.get("When on break route to", np.nan),
-                            'holiday': dr.get(next((col for col in ["When on holiday route to", "When on holiday route to "] if col in dr.index), "non_existing_col"), np.nan),
-                            'default': dr.get("Send call to", np.nan),
-                            'invalid': dr.get("Invalid input destination", np.nan)
+                            'holiday': dr.get(next((col for col in ["When on holiday route to", "When on holiday route to "] if col in dr.index), "non_existing_col"), np.nan)
                         }
-                        draw_destination_refactored(dot_individual, office_check_node_id, "Nee", dest_strings['closed'], all_data, context_id, added_nodes_indiv, added_edges_indiv, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Check", "OFFICECHECK")]))
-                        draw_destination_refactored(dot_individual, break_check_node_id, "Ja", dest_strings['break'], all_data, context_id, added_nodes_indiv, added_edges_indiv, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Check", "BREAKCHECK")]))
-                        holiday_type, _ = parse_destination(dest_strings['holiday'])
-                        if holiday_type:
-                            draw_destination_refactored(dot_individual, holiday_check_node_id, "Ja", dest_strings['holiday'], all_data, context_id, added_nodes_indiv, added_edges_indiv, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Check", "HOLIDAYCHECK")]))
-                        else:
-                            edge_key = (holiday_check_node_id, in_hours_node_id, "Ja (geen route)")
-                            if edge_key not in added_edges_indiv:
-                                dot_individual.edge(holiday_check_node_id, in_hours_node_id, label="Ja (geen route)")
-                                added_edges_indiv.add(edge_key)
-                        ivr_timeout_edge_label_part = f" ({int(ivr_timeout_num)}s)" if pd.notna(ivr_timeout_num) else ""
-                        if has_menu:
-                            create_or_get_node_refactored(dot_individual, in_hours_node_id, "🎶 Menu speelt...", added_nodes_indiv)
-                            for key, dest_str in menu_options_strings.items():
-                                draw_destination_refactored(dot_individual, in_hours_node_id, f"Kies {key}", dest_str, all_data, context_id, added_nodes_indiv, added_edges_indiv, depth=1, max_depth=10, visited_paths=set([(dr_node_id, f"Menu {key}", f"Menu {key}")]))
-                            timeout_edge_label = f"Timeout{ivr_timeout_edge_label_part} /\\nGeen invoer"
-                            draw_destination_refactored(dot_individual, in_hours_node_id, timeout_edge_label, dest_strings['default'], all_data, context_id, added_nodes_indiv, added_edges_indiv, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Timeout/Default", f"Timeout{ivr_timeout_edge_label_part}")]))
-                            if pd.notna(dest_strings['invalid']) and dest_strings['invalid'] != dest_strings['default']:
-                                 draw_destination_refactored(dot_individual, in_hours_node_id, "Invalid", dest_strings['invalid'], all_data, context_id, added_nodes_indiv, added_edges_indiv, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Invalid Input", f"Invalid {dest_strings['invalid']}")]))
-                        else:
-                            create_or_get_node_refactored(dot_individual, in_hours_node_id, "Geen menu", added_nodes_indiv)
-                            draw_destination_refactored(dot_individual, in_hours_node_id, "Direct", dest_strings['default'], all_data, context_id, added_nodes_indiv, added_edges_indiv, depth=1, max_depth=10, visited_paths=set([(dr_node_id, "Direct", f"Direct {dest_strings['default']}")]))
+                        draw_destination_refactored(dot_individual, office_check_node_id_indiv, office_check_label_indiv, office_node_type_indiv, "Nee (Gesloten)", dest_strings_indiv['closed'], all_data, context_id, flow_context_csv_indiv, users_in_flow_set_indiv, users_in_flow_data_list_indiv, added_nodes_indiv, added_edges_indiv, depth=1, max_depth=10, visited_paths=set([(dr_node_id_indiv, "Check", office_check_node_id_indiv)]))
+                        
+                        break_check_node_id_indiv = make_node_id_refactored("BREAKCHECK", dr_ext_str, context_id)
+                        break_check_label_indiv = "Pauze actief?"
+                        _, break_shape_indiv, break_color_indiv, break_node_type_indiv = get_node_label_and_style("", "Check", all_data)
+                        create_or_get_node_refactored(dot_individual, break_check_node_id_indiv, break_check_label_indiv, added_nodes_indiv, shape=break_shape_indiv, fillcolor=break_color_indiv)
+                        edge_key_office_break_indiv = (office_check_node_id_indiv, break_check_node_id_indiv, "Ja")
+                        if edge_key_office_break_indiv not in added_edges_indiv:
+                            dot_individual.edge(office_check_node_id_indiv, break_check_node_id_indiv, label="Ja")
+                            added_edges_indiv.add(edge_key_office_break_indiv)
+                        draw_destination_refactored(dot_individual, break_check_node_id_indiv, break_check_label_indiv, break_node_type_indiv, "Ja (Pauze)", dest_strings_indiv['break'], all_data, context_id, flow_context_csv_indiv, users_in_flow_set_indiv, users_in_flow_data_list_indiv, added_nodes_indiv, added_edges_indiv, depth=1, max_depth=10, visited_paths=set([(dr_node_id_indiv, "Check", break_check_node_id_indiv)]))
 
-                        # Toon grafiek (binnen with expander)
+                        holiday_check_node_id_indiv = make_node_id_refactored("HOLIDAYCHECK", dr_ext_str, context_id)
+                        holiday_check_label_indiv = "Vakantie actief?"
+                        _, holiday_shape_indiv, holiday_color_indiv, holiday_node_type_indiv = get_node_label_and_style("", "Check", all_data)
+                        create_or_get_node_refactored(dot_individual, holiday_check_node_id_indiv, holiday_check_label_indiv, added_nodes_indiv, shape=holiday_shape_indiv, fillcolor=holiday_color_indiv)
+                        edge_key_break_holiday_indiv = (break_check_node_id_indiv, holiday_check_node_id_indiv, "Nee")
+                        if edge_key_break_holiday_indiv not in added_edges_indiv: 
+                            dot_individual.edge(break_check_node_id_indiv, holiday_check_node_id_indiv, label="Nee")
+                            added_edges_indiv.add(edge_key_break_holiday_indiv)
+                        draw_destination_refactored(dot_individual, holiday_check_node_id_indiv, holiday_check_label_indiv, holiday_node_type_indiv, "Ja (Vakantie)", dest_strings_indiv['holiday'], all_data, context_id, flow_context_csv_indiv, users_in_flow_set_indiv, users_in_flow_data_list_indiv, added_nodes_indiv, added_edges_indiv, depth=1, max_depth=10, visited_paths=set([(dr_node_id_indiv, "Check", holiday_check_node_id_indiv)]))
+
+                        in_hours_node_id_indiv = make_node_id_refactored("INHOURS", dr_ext_str, context_id)
+                        in_hours_label_indiv = "Actie binnen kantooruren" if not has_menu_indiv else "🎶 Menu speelt..."
+                        create_or_get_node_refactored(dot_individual, in_hours_node_id_indiv, in_hours_label_indiv, added_nodes_indiv, shape='ellipse', fillcolor='lightgrey')
+                        edge_key_holiday_inhours_indiv = (holiday_check_node_id_indiv, in_hours_node_id_indiv, "Nee")
+                        if edge_key_holiday_inhours_indiv not in added_edges_indiv: 
+                            dot_individual.edge(holiday_check_node_id_indiv, in_hours_node_id_indiv, label="Nee")
+                            added_edges_indiv.add(edge_key_holiday_inhours_indiv)
+                        
+                        menu_options_dr_indiv = []
+                        if has_menu_indiv:
+                            for i_indiv, dest_str_indiv_val in menu_options_strings_indiv.items():
+                                menu_options_dr_indiv.append((f"Kies {i_indiv}", dest_str_indiv_val))
+                            menu_options_dr_indiv.append((f"Timeout{ivr_timeout_info_indiv.replace('\\n', ' ')} / Geen invoer", dr.get("Send call to", np.nan)))
+                            invalid_dest_dr_indiv = dr.get("Invalid input destination", np.nan)
+                            if pd.notna(invalid_dest_dr_indiv) and invalid_dest_dr_indiv != dr.get("Send call to", np.nan):
+                                menu_options_dr_indiv.append(("Invalid Input", invalid_dest_dr_indiv))
+                        else: 
+                            menu_options_dr_indiv.append(("Direct", dr.get("Send call to", np.nan)))
+
+                        for edge_lbl_indiv, dest_s_indiv in menu_options_dr_indiv:
+                            if pd.notna(dest_s_indiv) and str(dest_s_indiv).strip():
+                                # depth is hier 1, max_depth expliciet meegegeven
+                                draw_destination_refactored(dot_individual, in_hours_node_id_indiv, in_hours_label_indiv, "InHoursAction", edge_lbl_indiv, dest_s_indiv, all_data, context_id, flow_context_csv_indiv, users_in_flow_set_indiv, users_in_flow_data_list_indiv, added_nodes_indiv, added_edges_indiv, depth=1, max_depth=10, visited_paths=set([(dr_node_id_indiv, "InHours", in_hours_node_id_indiv)]))
+
                         try:
                             st.graphviz_chart(dot_individual, use_container_width=True)
                         except Exception as e:
                             st.error(f"Fout genereren grafiek voor IVR '{dr_name}' ({dr_ext_str}): {e}")
                             st.code(dot_individual.source, language='dot')
+                        
+                        if users_in_flow_data_list_indiv:
+                            df_indiv_users = pd.DataFrame(users_in_flow_data_list_indiv)
+                            df_indiv_users.drop_duplicates(inplace=True)
+                            csv_indiv_users = df_indiv_users.to_csv(index=False).encode('utf-8')
+                            st.download_button(
+                                label=f"Download Gebruikers ({len(df_indiv_users)} regels) in Flow \"{dr_name} ({dr_ext_str})\" als CSV",
+                                data=csv_indiv_users,
+                                file_name=f'users_in_flow_IVR_{dr_ext_str}.csv',
+                                mime='text/csv',
+                                key=f'download_indiv_{dr_ext_str}'
+                            )
+                        else:
+                            st.info("Geen gebruikersdata gevonden in deze flow om te downloaden.")
             # Einde van: if not drs_zonder_geldig_onderdeel.empty:
             # Voeg eventueel een melding toe als er helemaal geen DRs zijn
             elif not drs_met_geldig_onderdeel.empty: # Alleen als er wel geldige waren
