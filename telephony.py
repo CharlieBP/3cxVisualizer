@@ -24,30 +24,40 @@ st.set_page_config(layout="wide")
 
 # --- Helper Functies ---
 def normalize_nl_number(number_str):
-    """Probeert een NL telefoonnummer string te normaliseren naar een integer format (bv. 3188...)."""
     if pd.isna(number_str) or not isinstance(number_str, str):
         return None
     
-    # Verwijder veelvoorkomende tekens: +, *, spaties, (0)
-    cleaned_number = number_str.replace("+", "").replace("*", "").replace(" ", "").replace("(0)", "")
-    
-    # Specifieke NL logica
-    if cleaned_number.startswith('0'):
-        # Vervang leidende 0 door 31 (aanname NL nummer)
-        normalized = "31" + cleaned_number[1:]
-    elif cleaned_number.startswith('31'):
-        # Heeft al landcode
-        normalized = cleaned_number
-    else:
-        # Geen duidelijke NL prefix, kan geen landcode toevoegen. 
-        # Misschien is het al een nummer zonder landcode of een buitenlands nummer?
-        # Voor nu: retourneer zoals het is als het alleen cijfers zijn, anders None
-        if cleaned_number.isdigit():
-             normalized = cleaned_number # Behandel als mogelijk lokaal nummer of extensie
-        else:
-             return None # Kan niet converteren
+    cleaned_number = str(number_str).strip() # Start met basis strip
+    cleaned_number = cleaned_number.replace("(0)", "") # Verwijder (0) vroeg
+    cleaned_number = cleaned_number.replace("+", "").replace(" ", "").replace("*", "") # Verwijder andere tekens
 
-    # Converteer naar integer indien mogelijk
+    if not cleaned_number: return None
+    
+    # Check of het na opschoning nog steeds een valide nummer-achtige string is
+    # (kan beginnen met 00 voor landcode, verder alleen cijfers)
+    if cleaned_number.startswith('00') and cleaned_number[2:].isdigit():
+        # bv 0031... strip 00, wordt 31...
+        # of 0049... strip 00, wordt 49...
+        cleaned_number = cleaned_number[2:] 
+    elif not cleaned_number.isdigit():
+        return None # Als het niet alleen cijfers zijn (en ook niet 00... was), dan ongeldig
+
+    # Nu is cleaned_number gegarandeerd een string van cijfers (bv "31..." of "0..." of "6..." of kortere extensie)
+    
+    # 1. Heeft al NL landcode (of andere landcode na 00-strip)
+    if cleaned_number.startswith('31') and len(cleaned_number) >= 11: # bv. 31881234567 (11), 31612345678 (11)
+        normalized = cleaned_number
+    # 2. Heeft een leidende 0 (typisch NL formaat)
+    elif cleaned_number.startswith('0') and len(cleaned_number) == 10: # bv. 0881234567, 0612345678
+        normalized = "31" + cleaned_number[1:]
+    # 3. Nationaal nummer zonder 0, maar wel typische lengte (9 cijfers)
+    #    bv. 881234567 (wordt 31881234567) of 612345678 (wordt 31612345678)
+    elif len(cleaned_number) == 9 and cleaned_number[0] != '0': # Eerste cijfer kan niet '0' zijn hier
+        normalized = "31" + cleaned_number
+    # 4. Kortere nummers (extensies), of nummers die niet aan bovenstaande NL-specifieke criteria voldoen
+    else:
+        normalized = cleaned_number # Geef de schoongemaakte cijferreeks (mogelijk extensie) terug
+        
     try:
         return int(normalized)
     except (ValueError, TypeError):
@@ -56,60 +66,52 @@ def normalize_nl_number(number_str):
 def get_user_details_for_csv(user_identifier, identifier_type, all_data, flow_context,
                              reached_via_type=None, reached_via_name=None, reached_via_ext=None):
     """
-    Haalt gebruikersdetails op voor CSV-export.
-    user_identifier: Kan een user number of user name zijn.
-    identifier_type: "Number" of "Naam".
-    all_data: De volledige dataset.
-    flow_context: Context van de flow (Onderdeel naam of DR extensie).
+    Haalt gebruikersdetails (volledige rij uit Users.csv) op voor CSV-export,
+    aangevuld met flow-context en nummerblokinformatie.
     """
     users_df = all_data.get("users", pd.DataFrame())
-    nummerblok_ranges = all_data.get("nummerblok_ranges", []) # Moet gevuld zijn vanuit load_data
+    nummerblok_ranges = all_data.get("nummerblok_ranges", [])
     if users_df.empty:
         return None
 
     user_info_series = None
     if identifier_type == "Number":
-        # Zorg ervoor dat user_identifier een string is voor de vergelijking, net als de 'Number' kolom
         match = users_df[users_df["Number"] == str(user_identifier)]
         if not match.empty:
             user_info_series = match.iloc[0]
     elif identifier_type == "Naam":
-        match = users_df[users_df["Naam"] == str(user_identifier)] # 'Naam' is al een string
+        match = users_df[users_df["Naam"] == str(user_identifier)]
         if not match.empty:
             user_info_series = match.iloc[0]
 
     if user_info_series is not None:
-        # Gebruik de globale find_nummerblok_for_number functie
+        # Start met alle kolommen van de user als een dictionary
+        user_details_dict = user_info_series.to_dict()
+
+        # Voeg flow context en Reached Via info toe
+        user_details_dict["FlowContext"] = flow_context
+        user_details_dict["Reached Via Type"] = str(reached_via_type) if reached_via_type else ""
+        user_details_dict["Reached Via Name"] = str(reached_via_name) if reached_via_name else ""
+        user_details_dict["Reached Via Ext"] = str(reached_via_ext) if reached_via_ext else ""
+
+        # Voeg nummerblok informatie toe
         did_s = str(user_info_series.get('DID', ''))
         ob_cid = str(user_info_series.get('OutboundCallerID', ''))
         did_blokken_found = set()
         if did_s:
-            for did_part in did_s.split(':'): # Kan meerdere DIDs bevatten, gescheiden door ':'
+            for did_part in did_s.split(':'):
                 blok = find_nummerblok_for_number(did_part.strip(), nummerblok_ranges)
                 if blok: did_blokken_found.add(blok)
         outbound_blok_gevonden = find_nummerblok_for_number(ob_cid, nummerblok_ranges)
-        did_blokken_str = ", ".join(sorted(list(did_blokken_found))) if did_blokken_found else ""
-        outbound_blok_str = outbound_blok_gevonden if outbound_blok_gevonden else ""
-
-        department = user_info_series.get('Department', 'Geen Afdeling')
-        if pd.isna(department) or str(department).strip() == "":
-            department = "Geen Afdeling"
-
-        return {
-            "FlowContext": flow_context,
-            "User Name": user_info_series.get('Naam', ''),
-            "User Number": user_info_series.get('Number', ''),
-            "User Department": str(department),
-            "Mobile": str(user_info_series.get('MobileNumber', '')),
-            "Email": str(user_info_series.get('EmailAddress', '')),
-            "DID": did_s, # Volledige DID string
-            "Outbound CID": ob_cid, # Volledige Outbound CID
-            "Nummerblok(ken) DID": did_blokken_str,
-            "Nummerblok OutboundCID": outbound_blok_str,
-            "Reached Via Type": str(reached_via_type) if reached_via_type else "",
-            "Reached Via Name": str(reached_via_name) if reached_via_name else "",
-            "Reached Via Ext": str(reached_via_ext) if reached_via_ext else ""
-        }
+        
+        user_details_dict["Nummerblok(ken) DID"] = ", ".join(sorted(list(did_blokken_found))) if did_blokken_found else ""
+        user_details_dict["Nummerblok OutboundCID"] = outbound_blok_gevonden if outbound_blok_gevonden else ""
+        
+        # Converteer alle waarden naar string om problemen met mixed types in CSV te voorkomen
+        for key, value in user_details_dict.items():
+            user_details_dict[key] = str(value)
+            
+        return user_details_dict
     return None
 
 # --- Data laad functie (uit ZIP) ---
@@ -526,10 +528,9 @@ if all_data:
         
         # --- VERZAMEL GEBRUIKERSDATA --- 
         if target_node_type == "User":
-            # Gebruik dest_id (extensienummer) voor de key in de set
-            user_key_tuple = (str(dest_id), flow_context_for_csv, "DIRECT") # DIRECT om te onderscheiden van Q/RG leden
+            # Gebruik dest_id (extensienummer) en flow_context voor de key in de set
+            user_key_tuple = (str(dest_id), flow_context_for_csv)
             if user_key_tuple not in users_in_flow_set:
-                # Gebruiker direct bereikt, geen Reached Via info nodig hier (wordt default None)
                 user_details = get_user_details_for_csv(dest_id, "Number", current_all_data, flow_context_for_csv)
                 if user_details:
                     users_in_flow_data_list.append(user_details)
@@ -542,7 +543,7 @@ if all_data:
                 if not queue_match.empty:
                     queue_info = queue_match.iloc[0]
                     q_name = queue_info.get('Queue Name', f'Queue {dest_id}')
-                    q_ext = str(dest_id) # dest_id is al de queue extensie
+                    q_ext = str(dest_id)
                     for col_name in queue_info.index:
                         if col_name.startswith("User ") and pd.notna(queue_info[col_name]):
                             user_name_in_queue = str(queue_info[col_name])
@@ -551,12 +552,11 @@ if all_data:
                             if not user_member_match.empty:
                                 user_member_number = user_member_match.iloc[0].get("Number")
                                 if user_member_number:
-                                    # Key voor de set: user number, flow context, en via welke Q/RG
-                                    user_key_tuple = (str(user_member_number), flow_context_for_csv, f"QUEUE_{q_ext}")
+                                    # Key voor de set: user number en flow context
+                                    user_key_tuple = (str(user_member_number), flow_context_for_csv)
                                     if user_key_tuple not in users_in_flow_set:
                                         user_details = get_user_details_for_csv(user_name_in_queue, "Naam", current_all_data, flow_context_for_csv,
-                                        # Haal details op basis van naam, want dat is wat we hebben uit de queue CSV
-                                        user_details = get_user_details_for_csv(user_name_in_queue, "Naam", current_all_data, flow_context_for_csv)
+                                                                              reached_via_type="Queue", reached_via_name=q_name, reached_via_ext=q_ext)
                                         if user_details:
                                             users_in_flow_data_list.append(user_details)
                                             users_in_flow_set.add(user_key_tuple)
@@ -567,6 +567,8 @@ if all_data:
                 rg_match = ringgroups_df_local[ringgroups_df_local["Virtual Extension Number"] == str(dest_id)]
                 if not rg_match.empty:
                     rg_info = rg_match.iloc[0]
+                    rg_name = rg_info.get('Ring Group Name', f'RG {dest_id}')
+                    rg_ext = str(dest_id)
                     for col_name in rg_info.index:
                         if col_name.startswith("User ") and pd.notna(rg_info[col_name]):
                             user_name_in_rg = str(rg_info[col_name])
@@ -575,9 +577,11 @@ if all_data:
                             if not user_member_match.empty:
                                 user_member_number = user_member_match.iloc[0].get("Number")
                                 if user_member_number:
+                                    # Key voor de set: user number en flow context
                                     user_key_tuple = (str(user_member_number), flow_context_for_csv)
                                     if user_key_tuple not in users_in_flow_set:
-                                        user_details = get_user_details_for_csv(user_name_in_rg, "Naam", current_all_data, flow_context_for_csv)
+                                        user_details = get_user_details_for_csv(user_name_in_rg, "Naam", current_all_data, flow_context_for_csv,
+                                                                              reached_via_type="RingGroup", reached_via_name=rg_name, reached_via_ext=rg_ext)
                                         if user_details:
                                             users_in_flow_data_list.append(user_details)
                                             users_in_flow_set.add(user_key_tuple)
@@ -715,6 +719,10 @@ if all_data:
                              # Toch de download knop tonen, ook al is de lijst leeg
                              if users_in_flow_data_list_onderdeel:
                                 df_onderdeel_users = pd.DataFrame(users_in_flow_data_list_onderdeel)
+                                # Verwijder duplicaten op User Number, behoud de eerste keer dat de user werd gevonden
+                                if "User Number" in df_onderdeel_users.columns:
+                                    df_onderdeel_users.drop_duplicates(subset=["User Number"], keep='first', inplace=True)
+                                
                                 csv_onderdeel_users = df_onderdeel_users.to_csv(index=False).encode('utf-8')
                                 st.download_button(
                                     label=f"Download Gebruikers in Flow ({onderdeel_naam}) als CSV",
@@ -854,9 +862,10 @@ if all_data:
                         # Download knop voor gebruikers in deze onderdeel-flow
                         if users_in_flow_data_list_onderdeel:
                             df_onderdeel_users = pd.DataFrame(users_in_flow_data_list_onderdeel)
-                            # Zorg voor unieke rijen voor het geval een gebruiker via meerdere directe paden in de lijst kwam
-                            # (Hoewel users_in_flow_set dit al grotendeels zou moeten afvangen op user_number-context niveau)
-                            df_onderdeel_users.drop_duplicates(inplace=True) 
+                            # Verwijder duplicaten op User Number, behoud de eerste keer dat de user werd gevonden
+                            if "User Number" in df_onderdeel_users.columns:
+                                df_onderdeel_users.drop_duplicates(subset=["User Number"], keep='first', inplace=True)
+                            
                             csv_onderdeel_users = df_onderdeel_users.to_csv(index=False).encode('utf-8')
                             st.download_button(
                                 label=f"Download Gebruikers ({len(df_onderdeel_users)} regels) in Flow \"{onderdeel_naam}\" als CSV",
@@ -996,7 +1005,10 @@ if all_data:
                         
                         if users_in_flow_data_list_indiv:
                             df_indiv_users = pd.DataFrame(users_in_flow_data_list_indiv)
-                            df_indiv_users.drop_duplicates(inplace=True)
+                            # Verwijder duplicaten op User Number, behoud de eerste keer dat de user werd gevonden
+                            if "User Number" in df_indiv_users.columns:
+                                df_indiv_users.drop_duplicates(subset=["User Number"], keep='first', inplace=True)
+                            
                             csv_indiv_users = df_indiv_users.to_csv(index=False).encode('utf-8')
                             st.download_button(
                                 label=f"Download Gebruikers ({len(df_indiv_users)} regels) in Flow \"{dr_name} ({dr_ext_str})\" als CSV",
